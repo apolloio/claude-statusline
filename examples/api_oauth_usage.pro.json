@@ -1,0 +1,15 @@
+{
+  "five_hour": {
+    "utilization": 60.0,
+    "resets_at": "2026-04-25T17:00:01.230426+00:00"
+  },
+  "seven_day": {
+    "utilization": 7.0,
+    "resets_at": "2026-04-28T06:00:01.230447+00:00"
+  },
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": 100,
+    "used_credits": 0.0
+  }
+}

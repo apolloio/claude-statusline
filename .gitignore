@@ -1,0 +1,23 @@
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local Claude/agent configuration and credentials
+.claude/settings.local.json
+.claude/.credentials.json
+.env
+.env.*
+!.env.example
+.cache/
+.omx
+
+# Statusline runtime state and caches
+*.cache
+*.tsv
+*.lock
+*.error
+statusline-usage-cache.json
+
+# Local backups
+*.bak

@@ -1,0 +1,9 @@
+{
+  "five_hour": null,
+  "seven_day": null,
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": 50000,
+    "used_credits": 18627.0
+  }
+}
