@@ -61,6 +61,7 @@ All value strings are case-insensitive; unrecognized values fall back to `on`.
 | `CLAUDE_STATUSLINE_COST_CURRENT` | `on` \| `session` \| `instance` \| `off` | `on` | Which cost badges appear on line 2 (§8.6). `on`: show ∑ˢ always; show ∑ⁱ only when it differs from ∑ˢ. `session`: ∑ˢ only (cost since last `/clear`). `instance`: ∑ⁱ only (total cost for the current process lifetime). `off`: hide both badges. |
 | `CLAUDE_STATUSLINE_COST_LOADAVG` | `on` \| `spent_only` \| `off` | `on` | Rolling 💸 window behavior. `on` shows allowance suffix on 1h/1d; `spent_only` shows spent amounts only; `off` hides the whole 💸 segment and skips its computation. |
 | `CLAUDE_STATUSLINE_PERF_BADGE` | `on` \| `cache_only` \| `latency_only` \| `off` | `on` | Performance dots. `cache_only` skips response-time scan; `latency_only` skips cache-token scan; `off` skips all transcript I/O. |
+| `CLAUDE_STATUSLINE_ULTRACODE` | `on` \| `off` | `on` | Detect `/effort ultracode` from transcript attachments and render the rainbow `ultracode` badge in place of the `xhigh` glyph (§7.6). `off` skips the extra transcript scan. |
 | `CLAUDE_STATUSLINE_SHOW_PACE_RATIO` | `on` \| `off` | `on` | Show 🔥pace× in Enterprise monthly segment |
 
 ### 3.2 Context window thresholds
@@ -321,6 +322,33 @@ Branch gets priority: `branch_budget = min(combined × 55%, CLAUDE_STATUSLINE_BR
 | `effort_level == "max"` | `◈` | RED |
 
 Each flag prefixed with a space. Unknown `effort_level` → no glyph.
+
+#### Ultracode override
+
+`/effort ultracode` never arrives as its own value: Claude Code normalizes it internally
+(`{ultracode: "xhigh"}`), so `effort.level` is delivered as plain `"xhigh"` and there is no
+`ultracode` field in the payload. The only observable signal is the pair of transcript
+attachment records `ultra_effort_enter` / `ultra_effort_exit` (siblings of `plan_mode` /
+`plan_mode_exit`), matched in `transcript_path` as a last-event-wins state machine.
+
+When ultracode is detected, the `xhigh` glyph `◉` is replaced by the word `ultracode`
+rendered as a per-letter 256-color rainbow gradient (`196 208 220 190 82 51 33 99 201`),
+9 visible columns, still prefixed with a single space.
+
+Preconditions (all must hold):
+
+| Condition | Rationale |
+|---|---|
+| `CLAUDE_STATUSLINE_ULTRACODE != off` | User escape hatch |
+| `effort_level == "xhigh"` | Ultracode implies xhigh; any other level rules it out |
+| `transcript_path` exists and is readable | Signal source |
+| last matching attachment is `ultra_effort_enter` | Enter/exit state machine |
+
+Gating on `xhigh` also means no transcript scan happens for any other effort level.
+
+**Known limitations:** attachments are only written when the next user prompt is built, so a
+freshly toggled level is reflected one prompt late; and a message quoting the literal
+attachment-type text is a false positive.
 
 ### 7.7 Context window segment
 

@@ -153,6 +153,88 @@ load test_helper
   assert_line1_contains "◈"
 }
 
+# ── Ultracode detection (transcript ultra_effort_enter/exit attachments) ───────
+# Claude Code normalizes `/effort ultracode` to "xhigh" in the payload, so the
+# transcript attachment pair is the only signal. Last event wins.
+
+@test "line1: ultracode enter attachment renders name instead of xhigh glyph" {
+  local t="$BATS_TEST_TMPDIR/uc_enter.jsonl"
+  printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}' > "$t"
+  run_statusline "$(make_json effort=xhigh transcript="$t")"
+  assert_line1_contains "ultracode"
+}
+
+@test "line1: ultracode exit after enter falls back to xhigh glyph" {
+  local t="$BATS_TEST_TMPDIR/uc_exit.jsonl"
+  {
+    printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}'
+    printf '%s\n' '{"attachment":{"type":"ultra_effort_exit"}}'
+  } > "$t"
+  run_statusline "$(make_json effort=xhigh transcript="$t")"
+  assert_line1_contains "◉"
+  assert_line1_not_contains "ultracode"
+}
+
+@test "line1: ultracode re-enter after exit is active again (last event wins)" {
+  local t="$BATS_TEST_TMPDIR/uc_reenter.jsonl"
+  {
+    printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}'
+    printf '%s\n' '{"attachment":{"type":"ultra_effort_exit"}}'
+    printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}'
+  } > "$t"
+  run_statusline "$(make_json effort=xhigh transcript="$t")"
+  assert_line1_contains "ultracode"
+}
+
+@test "line1: plain xhigh transcript with no ultracode markers keeps glyph" {
+  local t="$BATS_TEST_TMPDIR/uc_none.jsonl"
+  printf '%s\n' '{"attachment":{"type":"todo_reminder"}}' > "$t"
+  run_statusline "$(make_json effort=xhigh transcript="$t")"
+  assert_line1_contains "◉"
+  assert_line1_not_contains "ultracode"
+}
+
+@test "line1: CLAUDE_STATUSLINE_ULTRACODE=off disables detection" {
+  local t="$BATS_TEST_TMPDIR/uc_off.jsonl"
+  printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}' > "$t"
+  CLAUDE_STATUSLINE_ULTRACODE=off run_statusline "$(make_json effort=xhigh transcript="$t")"
+  assert_line1_contains "◉"
+  assert_line1_not_contains "ultracode"
+}
+
+@test "line1: ultracode not shown when effort field absent" {
+  local t="$BATS_TEST_TMPDIR/uc_noeffort.jsonl"
+  printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}' > "$t"
+  run_statusline "$(make_json transcript="$t")"
+  assert_line1_not_contains "ultracode"
+}
+
+# Ultracode implies xhigh — a non-xhigh level rules it out even if the enter
+# attachment is still present (attachments lag one prompt behind a level change).
+@test "line1: ultracode ignored when effort is medium (implies xhigh only)" {
+  local t="$BATS_TEST_TMPDIR/uc_medium.jsonl"
+  printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}' > "$t"
+  run_statusline "$(make_json effort=medium transcript="$t")"
+  assert_line1_contains "◑"
+  assert_line1_not_contains "ultracode"
+}
+
+@test "line1: ultracode ignored when effort is max (implies xhigh only)" {
+  local t="$BATS_TEST_TMPDIR/uc_max.jsonl"
+  printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}' > "$t"
+  run_statusline "$(make_json effort=max transcript="$t")"
+  assert_line1_contains "◈"
+  assert_line1_not_contains "ultracode"
+}
+
+@test "line1: ultracode badge is rainbow-colored (multiple 256-color codes)" {
+  local t="$BATS_TEST_TMPDIR/uc_rainbow.jsonl"
+  printf '%s\n' '{"attachment":{"type":"ultra_effort_enter"}}' > "$t"
+  run_statusline "$(make_json effort=xhigh transcript="$t")"
+  assert_raw_line1_contains $'\033[38;5;196mu'
+  assert_raw_line1_contains $'\033[38;5;201me'
+}
+
 @test "line1: no effort glyph when effort field absent" {
   run_statusline "$(make_json)"
   assert_line1_not_contains "∅"
