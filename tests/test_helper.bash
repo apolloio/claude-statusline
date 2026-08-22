@@ -45,6 +45,8 @@ setup() {
   unset CLAUDE_STATUSLINE_EXTRA_PREVIEW_PCT
   unset CLAUDE_STATUSLINE_CWD_MAXLEN
   unset CLAUDE_STATUSLINE_BRANCH_MAXLEN
+  unset CLAUDE_STATUSLINE_GIT_STATUS
+  unset CLAUDE_STATUSLINE_GIT_UNTRACKED
   export COLUMNS=200  # deterministic terminal width for budget math (bypasses tput)
   export CLAUDE_STATUSLINE_INSTANCE_ID="test-instance"  # deterministic ∑ⁱ carry-file key
 

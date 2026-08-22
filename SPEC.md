@@ -63,6 +63,8 @@ All value strings are case-insensitive; unrecognized values fall back to `on`.
 | `CLAUDE_STATUSLINE_PERF_BADGE` | `on` \| `cache_only` \| `latency_only` \| `off` | `on` | Performance dots. `cache_only` skips response-time scan; `latency_only` skips cache-token scan; `off` skips all transcript I/O. |
 | `CLAUDE_STATUSLINE_ULTRACODE` | `on` \| `off` | `on` | Detect `/effort ultracode` from transcript attachments and render the rainbow `ultracode` badge in place of the `xhigh` glyph (§7.6). `off` skips the extra transcript scan. |
 | `CLAUDE_STATUSLINE_SHOW_PACE_RATIO` | `on` \| `off` | `on` | Show 🔥pace× in Enterprise monthly segment |
+| `CLAUDE_STATUSLINE_GIT_STATUS` | `off` \| `dirty` \| `on` | `off` | Git status markers on the line 1 branch segment (§7.3.1). `off`: no markers, no extra `git status` call. `dirty`: `*`/`?` markers only. `on`: markers plus `↑N`/`↓N` upstream divergence. |
+| `CLAUDE_STATUSLINE_GIT_UNTRACKED` | `on` \| `off` | `on` | Whether untracked files render the `?` marker (§7.3.1). Only consulted when `CLAUDE_STATUSLINE_GIT_STATUS != off`. `off` also passes `--untracked-files=no` to `git status`, which is faster in repos with large untracked/ignored trees. |
 
 ### 3.2 Context window thresholds
 
@@ -262,7 +264,7 @@ Performance badge dot colors (256-color):
 
 ### 7.1 Assembled format
 ```
-RESET YELLOW<cwd>RESET [GREEN⎇ <branch>RESET] [🧠] [MAGENTA<model>RESET][model_flags][ctx_display]
+RESET YELLOW<cwd>RESET [GREEN⎇ <branch>RESET[git_status_markers]] [🧠] [MAGENTA<model>RESET][model_flags][ctx_display]
 ```
 
 ### 7.2 CWD segment (yellow)
@@ -290,14 +292,35 @@ Applies to both CWD (§7.2) and git branch (§7.3). Given a string `str` and a `
 
 Terminal width is detected in order: (1) `$COLUMNS` env var — set by Claude Code ≥ 2.1.153 when spawning the statusline subprocess, and also honored as a manual override; (2) `/dev/tty` (fails in Claude Code — no controlling tty); (3) stderr-fd tty check (fails in Claude Code); (4) ancestor PTY walk — fallback for Claude Code < 2.1.153: walks `ppid` chain up to 8 hops, queries each ancestor's PTY via `stty -f /dev/$tty size` (macOS) or `stty -F /dev/$tty size` (Linux); (5) fallback 220 (wide, to avoid false compression). A floor of 88 is applied to the result. Fixed overhead is estimated from other line 1 elements (model name length, glyphs present). The combined free budget is `TERM_W − fixed_overhead` (floor at 20).
 
-Branch gets priority: `branch_budget = min(combined × 55%, CLAUDE_STATUSLINE_BRANCH_MAXLEN)`. Branch is resolved first so its actual display length drives the CWD budget: `cwd_budget = min(combined − len(branch_disp) − 3, CLAUDE_STATUSLINE_CWD_MAXLEN)` (floor at 8 each).
+Branch gets priority: `branch_budget = min(combined × 55%, CLAUDE_STATUSLINE_BRANCH_MAXLEN)`. Branch is resolved first so its actual display length drives the CWD budget: `cwd_budget = min(combined − len(branch_disp) − 3 − git_status_suffix_width, CLAUDE_STATUSLINE_CWD_MAXLEN)` (floor at 8 each). `git_status_suffix_width` is the visible column width of the optional §7.3.1 marker suffix (0 when `CLAUDE_STATUSLINE_GIT_STATUS=off` or no branch is shown); it is accumulated arithmetically while the suffix is built (not measured with `_visible_len`, which is defined later in the script than line 1 assembly) so the subtraction stays exact and locale-independent even though `↑`/`↓` are multibyte.
 
 ### 7.3 Git branch segment (green, optional)
 - Shown only when `cwd` is non-empty and is inside a git repo.
 - Detection: `git -C "$cwd" --no-optional-locks rev-parse --git-dir`
 - Branch: `git symbolic-ref --short HEAD`, fallback to `git rev-parse --short HEAD` (detached).
 - **Shortening:** the visible length is capped at `min(dynamic_branch_budget, CLAUDE_STATUSLINE_BRANCH_MAXLEN)` using `_shorten_path` (see §7.2.1). Slash-segmented branch names are treated like paths.
-- Format: ` GREEN⎇ <branch>RESET`
+- Format: ` GREEN⎇ <branch>RESET[git_status_markers]`
+
+### 7.3.1 Git status markers (optional, `CLAUDE_STATUSLINE_GIT_STATUS`)
+
+Off by default — no extra `git` call is made unless enabled. When `CLAUDE_STATUSLINE_GIT_STATUS != off` and a branch is shown, one additional call collects working-tree state:
+
+```
+git -C "$cwd" --no-optional-locks status --porcelain=v1 --branch <--untracked-files=normal|no> 2>/dev/null
+```
+
+`--untracked-files=no` is passed when `CLAUDE_STATUSLINE_GIT_UNTRACKED=off`; otherwise `--untracked-files=normal`. The porcelain output is parsed with a single `awk` pass (never a bash `while read` loop) into four fields: `dirty` (any non-`##`/`??` line present), `untracked` (any `?? ` line present), `ahead`, `behind` (parsed from the `## branch...upstream [ahead N, behind N]` header). A failed or empty `git status` degrades silently to the plain branch segment — no markers, no error.
+
+Markers are appended immediately after the branch segment's `RESET`, **outside** `_shorten_path` — truncating a long branch never eats the status markers. Order: `*`, then `?` (both wrapped in one `YELLOW…RESET` run), then a space, then `↑N` (`DIM_GREEN`, `\033[2;32m`), then `↓N` (`DIM_ORANGE`, `\033[2;38;5;208m`), each with its own `RESET`. Any marker whose condition is false is omitted entirely, including the leading space before the arrows when neither is present.
+
+| Marker | Meaning | Color | Shown when |
+|---|---|---|---|
+| `*` | tracked modifications, staged or unstaged | `YELLOW` | `dirty` field is set, any `GIT_STATUS` mode |
+| `?` | untracked files present | `YELLOW` | `untracked` field is set AND `CLAUDE_STATUSLINE_GIT_UNTRACKED != off`, any `GIT_STATUS` mode |
+| `↑N` | N commits ahead of upstream | `DIM_GREEN` (dim/faint green) | `ahead > 0` AND `CLAUDE_STATUSLINE_GIT_STATUS=on` |
+| `↓N` | N commits behind upstream | `DIM_ORANGE` (dim/faint orange) | `behind > 0` AND `CLAUDE_STATUSLINE_GIT_STATUS=on` |
+
+`CLAUDE_STATUSLINE_GIT_STATUS=dirty` never computes or shows `↑N`/`↓N`, even when the branch has upstream divergence — only `on` does. Detached HEAD still shows `*`/`?` (no upstream tracking ref, so no arrows regardless of mode).
 
 ### 7.4 Thinking indicator (optional)
 - Shown when `thinking.enabled == "true"`.
@@ -843,6 +866,14 @@ flowchart TD
 | `date -jf` unavailable (Linux) | falls back to GNU `date -d` syntax |
 | Both BSD and GNU date fail | last resort: midnight = NOW - 86400 |
 | Auth-broken and burned simultaneously | auth-broken (🔑) wins: spend numbers can't be trusted |
+| `CLAUDE_STATUSLINE_GIT_STATUS=off` (default) | No `git status` call at all; identical output to the flag not existing |
+| `cwd` not a git repo | Whole branch segment (and any markers) absent, same as today |
+| Detached HEAD | Short hash shown; `*`/`?` still apply; no `↑`/`↓` (no upstream ref) |
+| No upstream configured | `*`/`?` only; no `↑`/`↓` even with `GIT_STATUS=on` |
+| `ahead=0` and `behind=0` | Neither arrow rendered, no leading space before them |
+| `git status` fails or exits non-zero | Degrades silently to the plain branch segment, no markers |
+| `CLAUDE_STATUSLINE_GIT_STATUS=dirty` | `*`/`?` rendered; `↑`/`↓` never computed for display even if ahead/behind |
+| `CLAUDE_STATUSLINE_GIT_UNTRACKED=off` | `?` never rendered; `--untracked-files=no` passed to `git status` |
 
 ---
 
