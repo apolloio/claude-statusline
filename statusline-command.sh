@@ -24,6 +24,8 @@ UC_RAINBOW=$'\033[38;5;196mu\033[38;5;208ml\033[38;5;220mt\033[38;5;190mr\033[38
 DOT_GREY=$'\033[38;5;245m'
 DIM_GREEN=$'\033[2;32m'          # ↑N ahead-of-upstream marker (§7.3.1)
 DIM_ORANGE=$'\033[2;38;5;208m'   # ↓N behind-upstream marker (§7.3.1)
+GIT_STAGED_COLOR="$GREEN"        # +N staged marker (§7.3.1)
+GIT_UNTRACKED_COLOR="$DIM"       # ?N untracked marker (§7.3.1)
 
 # ── Named thresholds ───────────────────────────────────────────────────────────
 COST_EQ_THRESHOLD=0.01    # ±$0.01 treated as equal (§8.6)
@@ -698,24 +700,36 @@ if [ -n "$_branch_disp" ] && [ "$git_status_mode" != "off" ]; then
   [ "$git_untracked_mode" = "off" ] && _ut_flag="--untracked-files=no"
   _gs_out=$(git -C "$cwd" --no-optional-locks status --porcelain=v1 --branch $_ut_flag 2>/dev/null)
   if [ -n "$_gs_out" ]; then
-    { IFS= read -r _gs_dirty; IFS= read -r _gs_untracked; IFS= read -r _gs_ahead; IFS= read -r _gs_behind; } < <(
+    { IFS= read -r _gs_staged; IFS= read -r _gs_unstaged; IFS= read -r _gs_untracked; IFS= read -r _gs_ahead; IFS= read -r _gs_behind; } < <(
       awk '
         /^## / {
           if (match($0, /ahead [0-9]+/))  { a = substr($0, RSTART + 6, RLENGTH - 6) }
           if (match($0, /behind [0-9]+/)) { b = substr($0, RSTART + 7, RLENGTH - 7) }
           next
         }
-        /^\?\? / { u = 1; next }
-        { d = 1 }
-        END { print d+0; print u+0; print a+0; print b+0 }
+        /^\?\? / { u++; next }
+        { if (substr($0, 1, 1) != " ") s++; if (substr($0, 2, 1) != " ") m++ }
+        END { print s+0; print m+0; print u+0; print a+0; print b+0 }
       ' <<< "$_gs_out"
     )
     _dirty_mark=""
-    [ "$_gs_dirty" = "1" ] && _dirty_mark+="*"
-    [ "$git_untracked_mode" != "off" ] && [ "$_gs_untracked" = "1" ] && _dirty_mark+="?"
+    if [ "${_gs_staged:-0}" -gt 0 ]; then
+      _dirty_mark+="${GIT_STAGED_COLOR}+${_gs_staged}${RESET}"
+      _git_status_suffix_width=$(( _git_status_suffix_width + 1 + ${#_gs_staged} ))
+    fi
+    if [ "${_gs_unstaged:-0}" -gt 0 ]; then
+      [ -n "$_dirty_mark" ] && { _dirty_mark+=" "; _git_status_suffix_width=$(( _git_status_suffix_width + 1 )); }
+      _dirty_mark+="${YELLOW}!${_gs_unstaged}${RESET}"
+      _git_status_suffix_width=$(( _git_status_suffix_width + 1 + ${#_gs_unstaged} ))
+    fi
+    if [ "$git_untracked_mode" != "off" ] && [ "${_gs_untracked:-0}" -gt 0 ]; then
+      [ -n "$_dirty_mark" ] && { _dirty_mark+=" "; _git_status_suffix_width=$(( _git_status_suffix_width + 1 )); }
+      _dirty_mark+="${GIT_UNTRACKED_COLOR}?${_gs_untracked}${RESET}"
+      _git_status_suffix_width=$(( _git_status_suffix_width + 1 + ${#_gs_untracked} ))
+    fi
     if [ -n "$_dirty_mark" ]; then
-      _git_status_suffix+="${YELLOW}${_dirty_mark}${RESET}"
-      _git_status_suffix_width=$(( _git_status_suffix_width + ${#_dirty_mark} ))
+      _git_status_suffix+=" ${_dirty_mark}"
+      _git_status_suffix_width=$(( _git_status_suffix_width + 1 ))
     fi
     if [ "$git_status_mode" = "on" ]; then
       _git_arrows=""
