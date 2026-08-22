@@ -1235,7 +1235,11 @@ _plan_slot() {
   local label="$1" int="$2" color="$3" resets="$4"
   local slot
   if [ "$int" -ge 100 ] 2>/dev/null; then
-    slot="${RED}${BOLD}🪫100%${RESET}"
+    slot="${RED}${label}:${BOLD}🪫100%${RESET}"
+    if [ -n "$resets" ]; then
+      local hhmm; hhmm=$(_iso_reset_hhmm "$resets")
+      [ -n "$hhmm" ] && slot+=" ${DIM}↻${hhmm}${RESET}"
+    fi
   else
     slot="${color}${label}:"
     if [ "$_usage_cache_stale" = "1" ]; then

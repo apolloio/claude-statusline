@@ -492,7 +492,7 @@ Format:
 - `_fh_sfx` / `_sd_sfx`: when utilization ≥ 75% and reset time available, append ` DIM↻HH:MMRESET`
   - Reset time: convert `resets_at` (UTC ISO 8601) → local `HH:MM`
 
-**5h-burned state** (`five_hour.utilization ≥ 100`): replace the 5h slot with `RED BOLD 🪫100%RESET`. The 7d slot keeps its normal rules. If the 7d slot also reaches 100%, apply the same 🪫 treatment to it.
+**5h-burned state** (`five_hour.utilization ≥ 100`): replace the 5h slot with `RED <label>:BOLD🪫100%RESET`, followed by ` DIM↻HH:MMRESET` when a reset time is available (unconditional on the burned state — no 75% gate). The 7d slot keeps its normal rules. If the 7d slot also reaches 100%, apply the same 🪫 treatment to it (with `7d:` as the label).
 
 ### 8.3 Extra usage badge — Pro/Max (optional)
 
@@ -863,7 +863,7 @@ flowchart TD
 | OAuth response is valid JSON but contains top-level `"error"` key | treated as fetch failure: sentinel written, previous cache preserved (good data not overwritten) |
 | Cache stale but fetch succeeded once before | ⚠️ stale state (distinct from 🔑) |
 | `used_credits ≥ monthly_limit` (Enterprise) | budget-burned: 🪫 glyph, no `≈%` and no 🔥pace× on monthly segment; allowances become 0 |
-| `five_hour.utilization ≥ 100` (Pro/Max) | 5h slot rendered as `RED BOLD 🪫100%` |
+| `five_hour.utilization ≥ 100` (Pro/Max) | 5h slot rendered as `RED 5h:BOLD🪫100%`, plus ` DIM↻HH:MM` reset suffix if `resets_at` available |
 | `date -jf` unavailable (Linux) | falls back to GNU `date -d` syntax |
 | Both BSD and GNU date fail | last resort: midnight = NOW - 86400 |
 | Auth-broken and burned simultaneously | auth-broken (🔑) wins: spend numbers can't be trusted |
