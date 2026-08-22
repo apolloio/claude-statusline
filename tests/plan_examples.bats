@@ -71,6 +71,21 @@ load test_helper
   assert_line2_contains "/\$1"
 }
 
+@test "example B: extra preview badge has no internal spaces" {
+  write_pro_cache 82 7 0 100
+  run_statusline "$(make_json cwd=/tmp cost=0.95 session=s1)"
+  local l2; l2=$(line2)
+  [[ "$l2" == *"+💰\$0.00/\$1"* ]]
+  [[ "$l2" != *"+💰 \$0.00 /\$1"* ]]
+}
+
+@test "example B: extra preview badge is separated from the 7d slot" {
+  write_pro_cache 82 7 0 100
+  run_statusline "$(make_json cwd=/tmp cost=0.95 session=s1)"
+  local l2; l2=$(line2)
+  [[ "$l2" == *"7d:7%  +💰\$0.00/\$1"* ]]
+}
+
 @test "example B: no extra badge when 5h < 75 and used=0" {
   write_pro_cache 60 7 0 100
   run_statusline "$(make_json cwd=/tmp cost=0.95 session=s1)"
