@@ -63,8 +63,8 @@ All value strings are case-insensitive; unrecognized values fall back to `on`.
 | `CLAUDE_STATUSLINE_PERF_BADGE` | `on` \| `cache_only` \| `latency_only` \| `off` | `on` | Performance dots. `cache_only` skips response-time scan; `latency_only` skips cache-token scan; `off` skips all transcript I/O. |
 | `CLAUDE_STATUSLINE_ULTRACODE` | `on` \| `off` | `on` | Detect `/effort ultracode` from transcript attachments and render the rainbow `ultracode` badge in place of the `xhigh` glyph (§7.6). `off` skips the extra transcript scan. |
 | `CLAUDE_STATUSLINE_SHOW_PACE_RATIO` | `on` \| `off` | `on` | Show 🔥pace× in Enterprise monthly segment |
-| `CLAUDE_STATUSLINE_GIT_STATUS` | `off` \| `dirty` \| `on` | `off` | Git status markers on the line 1 branch segment (§7.3.1). `off`: no markers, no extra `git status` call. `dirty`: `*`/`?` markers only. `on`: markers plus `↑N`/`↓N` upstream divergence. |
-| `CLAUDE_STATUSLINE_GIT_UNTRACKED` | `on` \| `off` | `on` | Whether untracked files render the `?` marker (§7.3.1). Only consulted when `CLAUDE_STATUSLINE_GIT_STATUS != off`. `off` also passes `--untracked-files=no` to `git status`, which is faster in repos with large untracked/ignored trees. |
+| `CLAUDE_STATUSLINE_GIT_STATUS` | `off` \| `dirty` \| `on` | `off` | Git status markers on the line 1 branch segment (§7.3.1). `off`: no markers, no extra `git status` call. `dirty`: `+N`/`!N`/`?N` count markers only. `on`: markers plus `↑N`/`↓N` upstream divergence. |
+| `CLAUDE_STATUSLINE_GIT_UNTRACKED` | `on` \| `off` | `on` | Whether untracked files render the `?N` marker (§7.3.1). Only consulted when `CLAUDE_STATUSLINE_GIT_STATUS != off`. `off` also passes `--untracked-files=no` to `git status`, which is faster in repos with large untracked/ignored trees. |
 
 ### 3.2 Context window thresholds
 
@@ -309,18 +309,19 @@ Off by default — no extra `git` call is made unless enabled. When `CLAUDE_STAT
 git -C "$cwd" --no-optional-locks status --porcelain=v1 --branch <--untracked-files=normal|no> 2>/dev/null
 ```
 
-`--untracked-files=no` is passed when `CLAUDE_STATUSLINE_GIT_UNTRACKED=off`; otherwise `--untracked-files=normal`. The porcelain output is parsed with a single `awk` pass (never a bash `while read` loop) into four fields: `dirty` (any non-`##`/`??` line present), `untracked` (any `?? ` line present), `ahead`, `behind` (parsed from the `## branch...upstream [ahead N, behind N]` header). A failed or empty `git status` degrades silently to the plain branch segment — no markers, no error.
+`--untracked-files=no` is passed when `CLAUDE_STATUSLINE_GIT_UNTRACKED=off`; otherwise `--untracked-files=normal`. The porcelain output is parsed with a single `awk` pass (never a bash `while read` loop) into five fields: `staged` (count of lines whose index column, position 1, is non-space and non-`?`), `unstaged` (count of lines whose worktree column, position 2, is non-space and non-`?`), `untracked` (count of `?? ` lines), `ahead`, `behind` (parsed from the `## branch...upstream [ahead N, behind N]` header). A file with changes in both columns (e.g. staged-then-further-modified) counts toward both `staged` and `unstaged`. A failed or empty `git status` degrades silently to the plain branch segment — no markers, no error.
 
-Markers are appended immediately after the branch segment's `RESET`, **outside** `_shorten_path` — truncating a long branch never eats the status markers. Order: `*`, then `?` (both wrapped in one `YELLOW…RESET` run), then a space, then `↑N` (`DIM_GREEN`, `\033[2;32m`), then `↓N` (`DIM_ORANGE`, `\033[2;38;5;208m`), each with its own `RESET`. Any marker whose condition is false is omitted entirely, including the leading space before the arrows when neither is present.
+Markers are appended immediately after the branch segment's `RESET`, **outside** `_shorten_path` — truncating a long branch never eats the status markers. A single leading space separates the branch name from the marker suffix whenever any marker is shown. Order: `+N` (`GREEN`), then a space, `!N` (`YELLOW`), then a space, `?N` (`DIM`, `\033[90m`) — each present only if its count is non-zero, each with its own `RESET` — then a space, `↑N` (`DIM_GREEN`, `\033[2;32m`), then `↓N` (`DIM_ORANGE`, `\033[2;38;5;208m`), each with its own `RESET`. Any marker whose condition is false is omitted entirely, including its separating space.
 
 | Marker | Meaning | Color | Shown when |
 |---|---|---|---|
-| `*` | tracked modifications, staged or unstaged | `YELLOW` | `dirty` field is set, any `GIT_STATUS` mode |
-| `?` | untracked files present | `YELLOW` | `untracked` field is set AND `CLAUDE_STATUSLINE_GIT_UNTRACKED != off`, any `GIT_STATUS` mode |
+| `+N` | N files with staged changes | `GREEN` | `staged > 0`, any `GIT_STATUS` mode |
+| `!N` | N files with unstaged/worktree changes | `YELLOW` | `unstaged > 0`, any `GIT_STATUS` mode |
+| `?N` | N untracked files | `DIM` (`\033[90m`) | `untracked > 0` AND `CLAUDE_STATUSLINE_GIT_UNTRACKED != off`, any `GIT_STATUS` mode |
 | `↑N` | N commits ahead of upstream | `DIM_GREEN` (dim/faint green) | `ahead > 0` AND `CLAUDE_STATUSLINE_GIT_STATUS=on` |
 | `↓N` | N commits behind upstream | `DIM_ORANGE` (dim/faint orange) | `behind > 0` AND `CLAUDE_STATUSLINE_GIT_STATUS=on` |
 
-`CLAUDE_STATUSLINE_GIT_STATUS=dirty` never computes or shows `↑N`/`↓N`, even when the branch has upstream divergence — only `on` does. Detached HEAD still shows `*`/`?` (no upstream tracking ref, so no arrows regardless of mode).
+`CLAUDE_STATUSLINE_GIT_STATUS=dirty` never computes or shows `↑N`/`↓N`, even when the branch has upstream divergence — only `on` does. Detached HEAD still shows `+N`/`!N`/`?N` (no upstream tracking ref, so no arrows regardless of mode).
 
 ### 7.4 Thinking indicator (optional)
 - Shown when `thinking.enabled == "true"`.
@@ -868,12 +869,13 @@ flowchart TD
 | Auth-broken and burned simultaneously | auth-broken (🔑) wins: spend numbers can't be trusted |
 | `CLAUDE_STATUSLINE_GIT_STATUS=off` (default) | No `git status` call at all; identical output to the flag not existing |
 | `cwd` not a git repo | Whole branch segment (and any markers) absent, same as today |
-| Detached HEAD | Short hash shown; `*`/`?` still apply; no `↑`/`↓` (no upstream ref) |
-| No upstream configured | `*`/`?` only; no `↑`/`↓` even with `GIT_STATUS=on` |
+| Detached HEAD | Short hash shown; `+N`/`!N`/`?N` still apply; no `↑`/`↓` (no upstream ref) |
+| No upstream configured | `+N`/`!N`/`?N` only; no `↑`/`↓` even with `GIT_STATUS=on` |
 | `ahead=0` and `behind=0` | Neither arrow rendered, no leading space before them |
 | `git status` fails or exits non-zero | Degrades silently to the plain branch segment, no markers |
-| `CLAUDE_STATUSLINE_GIT_STATUS=dirty` | `*`/`?` rendered; `↑`/`↓` never computed for display even if ahead/behind |
-| `CLAUDE_STATUSLINE_GIT_UNTRACKED=off` | `?` never rendered; `--untracked-files=no` passed to `git status` |
+| `CLAUDE_STATUSLINE_GIT_STATUS=dirty` | `+N`/`!N`/`?N` rendered; `↑`/`↓` never computed for display even if ahead/behind |
+| `CLAUDE_STATUSLINE_GIT_UNTRACKED=off` | `?N` never rendered; `--untracked-files=no` passed to `git status` |
+| File staged and then further modified (e.g. `MM`) | Counts toward both `+N` (staged) and `!N` (unstaged) |
 
 ---
 
