@@ -926,12 +926,12 @@ Usage cache: synthetic override of Example A with `five_hour.utilization=82` (�
 Extra badge trigger: `82 ≥ 75` → extra badge shown.
 
 ```
-●●○○  5h:82% ↻17:00  7d:7%   +💰$0.00 /$1   ∑ˢ$0.95  💸  15m:$0.03  1h:$0.45  1d:$0.45
+●●○○  5h:82% ↻17:00  7d:7%   +💰$0.00/$1   ∑ˢ$0.95  💸  15m:$0.03  1h:$0.45  1d:$0.45
 ```
 
 - `5h:82%` — yellow (75 ≤ utilization < 90); ` ↻17:00` suffix because utilization ≥ 75% and `resets_at` parsed.
-- `+💰$0.00 /$1` — extra badge: `$0.00` bold, `/$1` dim. `used_credits=0` and `monthly_limit=100¢` → `$0.00` and `$1`.
-- `+💰$0.00 /$1` — show this only if there is any limit (cap) and if and only if 5h >=75% (default `EXTRA_PREVIEW_PCT`)
+- `+💰$0.00/$1` — extra badge: `$0.00` bold, `/$1` dim. `used_credits=0` and `monthly_limit=100¢` → `$0.00` and `$1`.
+- `+💰$0.00/$1` — show this only if there is any limit (cap) and if and only if 5h >=75% (default `EXTRA_PREVIEW_PCT`)
 
 ### Example C — Enterprise, fresh cache, mid-month over-pace
 
