@@ -72,19 +72,20 @@ load test_helper
   make_git_repo "$repo" main
   echo dirty > "$repo/f"
   run_statusline "$(make_json cwd="$repo")"
-  assert_line1_not_contains "*"
-  assert_line1_not_contains "?"
+  assert_line1_not_contains "!1"
+  assert_line1_not_contains "?1"
 }
 
 @test "line1: GIT_STATUS=dirty on a clean repo shows no markers" {
   local repo="$BATS_TEST_TMPDIR/gs-clean"
   make_git_repo "$repo" main
   CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
-  assert_line1_not_contains "*"
-  assert_line1_not_contains "?"
+  assert_line1_not_contains "+"
+  assert_line1_not_contains "!"
+  assert_line1_not_contains "?1"
 }
 
-@test "line1: GIT_STATUS=dirty shows * for a modified tracked file" {
+@test "line1: GIT_STATUS=dirty shows !1 for an unstaged modified tracked file" {
   local repo="$BATS_TEST_TMPDIR/gs-dirty"
   make_git_repo "$repo" main
   echo x > "$repo/README"
@@ -92,27 +93,41 @@ load test_helper
   git -C "$repo" commit -qm "add README"
   echo y >> "$repo/README"
   CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
-  assert_line1_contains "*"
-  assert_line1_not_contains "?"
+  assert_line1_contains "!1"
+  assert_line1_not_contains "+"
+  assert_line1_not_contains "?1"
 }
 
-@test "line1: GIT_STATUS=dirty shows ? for an untracked file only" {
+@test "line1: GIT_STATUS=dirty shows +1 for a staged new file" {
+  local repo="$BATS_TEST_TMPDIR/gs-staged"
+  make_git_repo "$repo" main
+  echo x > "$repo/added.txt"
+  git -C "$repo" add added.txt
+  CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
+  assert_line1_contains "+1"
+  assert_line1_not_contains "!"
+  assert_line1_not_contains "?1"
+}
+
+@test "line1: GIT_STATUS=dirty shows ?1 for an untracked file only" {
   local repo="$BATS_TEST_TMPDIR/gs-untracked"
   make_git_repo "$repo" main
   echo new > "$repo/new.txt"
   CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
-  assert_line1_contains "?"
-  assert_line1_not_contains "*"
+  assert_line1_contains "?1"
+  assert_line1_not_contains "+"
+  assert_line1_not_contains "!"
 }
 
-@test "line1: GIT_UNTRACKED=off hides ? even with an untracked file" {
+@test "line1: GIT_UNTRACKED=off hides ?N even with an untracked file" {
   local repo="$BATS_TEST_TMPDIR/gs-untracked-off"
   make_git_repo "$repo" main
   echo new > "$repo/new.txt"
   CLAUDE_STATUSLINE_GIT_STATUS=dirty CLAUDE_STATUSLINE_GIT_UNTRACKED=off \
     run_statusline "$(make_json cwd="$repo")"
-  assert_line1_not_contains "?"
-  assert_line1_not_contains "*"
+  assert_line1_not_contains "?1"
+  assert_line1_not_contains "+"
+  assert_line1_not_contains "!"
 }
 
 @test "line1: GIT_STATUS=on shows ahead/behind counts against upstream" {
@@ -150,7 +165,7 @@ load test_helper
   assert_line1_not_contains "↓"
 }
 
-@test "line1: GIT_STATUS=dirty on detached HEAD shows hash plus * with no arrows" {
+@test "line1: GIT_STATUS=dirty on detached HEAD shows hash plus !1 with no arrows" {
   local repo="$BATS_TEST_TMPDIR/gs-detached"
   make_git_repo "$repo" main
   echo x > "$repo/README"
@@ -160,7 +175,7 @@ load test_helper
   echo y >> "$repo/README"
   CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
   assert_line1_contains "⎇"
-  assert_line1_contains "*"
+  assert_line1_contains "!1"
   assert_line1_not_contains "↑"
   assert_line1_not_contains "↓"
 }
@@ -184,9 +199,10 @@ load test_helper
   [ "$status" -eq 0 ]
   local dirty_line; dirty_line="$(line1)"
 
-  # Marker adds exactly one visible "*" character, and the CWD budget
-  # subtracts that width, so total line length should grow by exactly 1.
-  [ "$(( ${#dirty_line} - ${#off_line} )) " = "1 " ]
+  # Marker adds exactly three visible characters (" !1" incl. leading space),
+  # and the CWD budget subtracts that width, so total line length should grow
+  # by exactly 3.
+  [ "$(( ${#dirty_line} - ${#off_line} )) " = "3 " ]
 }
 
 # ── Model name ────────────────────────────────────────────────────────────────
