@@ -45,6 +45,9 @@ setup() {
   unset CLAUDE_STATUSLINE_EXTRA_PREVIEW_PCT
   unset CLAUDE_STATUSLINE_CWD_MAXLEN
   unset CLAUDE_STATUSLINE_BRANCH_MAXLEN
+  unset CLAUDE_STATUSLINE_TODOS
+  unset CLAUDE_STATUSLINE_TODO_MAXLEN
+  unset CLAUDE_CONFIG_DIR
   export COLUMNS=200  # deterministic terminal width for budget math (bypasses tput)
   export CLAUDE_STATUSLINE_INSTANCE_ID="test-instance"  # deterministic ∑ⁱ carry-file key
 
@@ -107,6 +110,23 @@ make_git_repo() {
   git -C "$dir" config user.email "test@example.com"
   git -C "$dir" config user.name "Test"
   git -C "$dir" commit --allow-empty -m "init" --quiet
+}
+
+# make_tasks <session_id> <id:status:subject[:activeForm]> ...
+# Writes task JSON files into $HOME/.claude/tasks/<session_id>/, matching
+# Claude Code's live task-state schema (statusline todo-progress segment).
+make_tasks() {
+  local session="$1"; shift
+  local dir="$HOME/.claude/tasks/$session"
+  mkdir -p "$dir"
+  local spec id status subject activeForm activeform_field
+  for spec; do
+    IFS=: read -r id status subject activeForm <<< "$spec"
+    activeform_field=""
+    [ -n "$activeForm" ] && activeform_field="\"activeForm\":\"$activeForm\","
+    printf '{"id":"%s",%s"subject":"%s","status":"%s","blocks":[],"blockedBy":[]}\n' \
+      "$id" "$activeform_field" "$subject" "$status" > "$dir/$id.json"
+  done
 }
 
 # make_transcript <path> <role:epoch:input:creation:cache_read> ...

@@ -184,6 +184,17 @@ _mid_ellipsis() {
   printf '%s' "${str:0:$head}…${str:$tail_start}"
 }
 
+# _head_ellipsis(str, target_len) — tail-truncate with trailing "…"; for prose
+# where the head carries the meaning (e.g. task descriptions), unlike the
+# tail-weighted _mid_ellipsis used for paths.
+_head_ellipsis() {
+  local str="$1" target="$2"
+  local slen="${#str}"
+  if (( slen <= target )); then printf '%s' "$str"; return; fi
+  if (( target < 2 )); then printf '%s' "${str:0:$target}"; return; fi
+  printf '%s' "${str:0:$((target - 1))}…"
+}
+
 # _shorten_path(str, max) — slash-aware shortener for CWD and branch names
 _shorten_path() {
   local str="$1" max="$2"
@@ -413,6 +424,7 @@ cost_mode=$(_env_opt CLAUDE_STATUSLINE_COST_CURRENT on on session instance off)
 loadavg_mode=$(_env_opt CLAUDE_STATUSLINE_COST_LOADAVG on on spent_only off)
 sign_mode=$(_env_opt CLAUDE_STATUSLINE_BUDGET_SIGN_MODE neutral neutral used_minus remaining_plus both)
 show_pace_ratio=$(_env_opt CLAUDE_STATUSLINE_SHOW_PACE_RATIO on on off)
+todos_mode=$(_env_opt CLAUDE_STATUSLINE_TODOS off off counts on)
 
 hours_per_day="${CLAUDE_STATUSLINE_BUDGET_HOURS_PER_DAY:-6}"
 awk -v h="$hours_per_day" 'BEGIN { exit (h+0 > 0 ? 0 : 1) }' </dev/null 2>/dev/null || hours_per_day=6
@@ -582,6 +594,12 @@ case "$_CWD_MAXLEN_raw" in (*[!0-9]*|'') _CWD_MAXLEN=$_DEFAULT_CWD_MAXLEN ;; (*)
 [ "$_CWD_MAXLEN" -ge "$_MAXLEN_MIN" ] || _CWD_MAXLEN=$_DEFAULT_CWD_MAXLEN
 case "$_BRANCH_MAXLEN_raw" in (*[!0-9]*|'') _BRANCH_MAXLEN=$_DEFAULT_BRANCH_MAXLEN ;; (*) _BRANCH_MAXLEN=$_BRANCH_MAXLEN_raw ;; esac
 [ "$_BRANCH_MAXLEN" -ge "$_MAXLEN_MIN" ] || _BRANCH_MAXLEN=$_DEFAULT_BRANCH_MAXLEN
+
+# Env var ceiling for the todo-progress item text (§10 opt-in segment)
+_DEFAULT_TODO_MAXLEN=32
+_TODO_MAXLEN_raw="${CLAUDE_STATUSLINE_TODO_MAXLEN:-$_DEFAULT_TODO_MAXLEN}"
+case "$_TODO_MAXLEN_raw" in (*[!0-9]*|'') _TODO_MAXLEN=$_DEFAULT_TODO_MAXLEN ;; (*) _TODO_MAXLEN=$_TODO_MAXLEN_raw ;; esac
+[ "$_TODO_MAXLEN" -ge "$_MAXLEN_MIN" ] || _TODO_MAXLEN=$_DEFAULT_TODO_MAXLEN
 
 # Terminal width with floor. stdin is the JSON payload (not a tty).
 # Detection chain:
@@ -862,6 +880,39 @@ if [ "$perf_mode" != "off" ]; then
   esac
 
   perf_badge=$(_build_perf_badge "$overall_level")
+fi
+
+# ── Todo/task progress (§10 opt-in segment) ───────────────────────────────────
+# Reads ~/.claude/tasks/<session_id>/ (Claude Code's own task state, honoring
+# CLAUDE_CONFIG_DIR — deliberately NOT $_CLAUDE_DIR, which scopes this script's
+# own caches). Read-only; this script never writes there.
+_todo_seg_full="" _todo_seg_short=""
+if [ "$todos_mode" != "off" ] && [ -n "$session_id" ]; then
+  _TASK_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/tasks/$session_id"
+  if [ -d "$_TASK_DIR" ]; then
+    _todo_total="" _todo_completed="" _todo_text=""
+    { IFS= read -r _todo_total; IFS= read -r _todo_completed; IFS= read -r _todo_text; } < <(
+      jq -s -r '
+        map(select(.id != null)) as $tasks
+        | ($tasks | length) as $total
+        | ([$tasks[] | select(.status == "completed")] | length) as $completed
+        | ([$tasks[] | select(.status == "in_progress")] + [$tasks[] | select(.status == "pending")]) as $active
+        | (if ($active | length) > 0 then ($active[0].activeForm // $active[0].subject // "") else "" end) as $text
+        | "\($total)", "\($completed)", "\($text)"
+      ' "$_TASK_DIR"/[0-9]*.json 2>/dev/null
+    )
+    if [ -n "$_todo_total" ] && [ "$_todo_total" -gt 0 ] 2>/dev/null && \
+       [ "$_todo_completed" -lt "$_todo_total" ] 2>/dev/null; then
+      _todo_seg_short="☑ ${_todo_completed}/${_todo_total}  "
+      if [ -n "$_todo_text" ]; then
+        _todo_text_trunc=$(_head_ellipsis "$_todo_text" "$_TODO_MAXLEN")
+        _todo_seg_full="☑ ${_todo_completed}/${_todo_total} ${DIM}${_todo_text_trunc}${RESET}  "
+      else
+        _todo_seg_full="$_todo_seg_short"
+      fi
+      [ "$todos_mode" = "counts" ] && _todo_seg_full="$_todo_seg_short"
+    fi
+  fi
 fi
 
 # ── Utility: visible-length measurement ──────────────────────────────────────
@@ -1340,35 +1391,38 @@ fi
 
 # ── Line 2 assembly (§10) ──────────────────────────────────────────────────────
 # §10 item 1: leading ZWSP + two spaces
-line2="${SPACE}  "
+_line2_prefix="${SPACE}  "
 
 # §10 item 2: performance badge
 if [ -n "$perf_badge" ]; then
-  line2+="${perf_badge}"
+  _line2_prefix+="${perf_badge}"
 fi
 # §10 item 3: always two spaces
-line2+="  "
+_line2_prefix+="  "
 
-# §10 items 4–7: slow-fetch + plan/extra/monthly (§8.2–§8.5)
+# §10 items 4–7: slow-fetch + plan/extra/monthly (§8.2–§8.5), built separately
+# from the todo segment (§10 item 3b) so the adaptive ladder below can weigh
+# both independently before assembling the final line2.
+_line2_mid=""
 _has_plan_seg=0
 [ -n "$plan_seg" ]   && _has_plan_seg=1
 [ -n "$extra_seg" ]  && _has_plan_seg=1
 [ -n "$monthly_seg" ] && _has_plan_seg=1
 # §8.5 slow-fetch ↻ — shown before segments when lock is old and segments non-empty
 if [ "$_usage_fetch_slow" = "1" ] && [ "$_has_plan_seg" = "1" ]; then
-  line2+="${DIM}↻${RESET}"
+  _line2_mid+="${DIM}↻${RESET}"
 fi
-[ -n "$plan_seg" ]    && line2+="${plan_seg}"
-[ -n "$extra_seg" ]   && line2+="${extra_seg}"
+[ -n "$plan_seg" ]    && _line2_mid+="${plan_seg}"
+[ -n "$extra_seg" ]   && _line2_mid+="${extra_seg}"
 if [ -n "$monthly_seg" ]; then
-  line2+="${monthly_seg}"  # monthly_seg already carries trailing "  "
+  _line2_mid+="${monthly_seg}"  # monthly_seg already carries trailing "  "
 elif [ "$_has_plan_seg" = "1" ]; then
-  line2+="  "
+  _line2_mid+="  "
 fi
 
 # §10 item 8: cost pair + 3 trailing spaces (if non-empty)
 if [ -n "$cost_seg" ]; then
-  line2+="${cost_seg}   "
+  _line2_mid+="${cost_seg}   "
 fi
 
 # §10 item 9: rolling 💸 windows — built into _spend_seg for adaptive truncation
@@ -1411,19 +1465,43 @@ elif [ "$loadavg_mode" != "off" ]; then
   _spend_seg="${DIM}💸${RESET}  15m:${DIM}—${RESET}  1h:${DIM}—${RESET}  1d:${DIM}—${RESET}"
 fi
 
-# Adaptive truncation: suppress spend segment if it would cause line 2 to wrap.
-# Uses _TERM_W_RAW (pre-floor) so narrow terminals (<88) still trigger suppression.
-if [ -n "$_spend_seg" ]; then
+# Adaptive truncation. Uses _TERM_W_RAW (pre-floor) so narrow terminals
+# (<88) still trigger suppression.
+if [ -n "$_todo_seg_full" ] || [ -n "$_todo_seg_short" ]; then
+  # Three-tier ladder: todo item text → todo counts-only → drop spend segment.
+  # Never degrade a tier when the degradation can't bring the line under
+  # budget — if the line already overflows without any optional segment,
+  # keep the richest form (mirrors the single-segment guard below).
   _line2_available=$(( _TERM_W_RAW - 3 ))
-  _len_without=$(( $(_visible_len "$line2") - 3 ))
+  _len_base=$(( $(_visible_len "${_line2_prefix}${_line2_mid}") - 3 ))
+  _len_full=$(_visible_len "$_todo_seg_full")
+  _len_short=$(_visible_len "$_todo_seg_short")
   _len_spend=$(_visible_len "$_spend_seg")
 
-  if [ "$_len_without" -le "$_line2_available" ] && \
-     [ $(( _len_without + _len_spend )) -gt "$_line2_available" ]; then
-    _spend_seg=""
+  if [ "$_len_base" -gt "$_line2_available" ] || \
+     [ $(( _len_base + _len_full + _len_spend )) -le "$_line2_available" ]; then
+    _todo_chosen="$_todo_seg_full"; _spend_chosen="$_spend_seg"
+  elif [ $(( _len_base + _len_short + _len_spend )) -le "$_line2_available" ]; then
+    _todo_chosen="$_todo_seg_short"; _spend_chosen="$_spend_seg"
+  else
+    _todo_chosen="$_todo_seg_short"; _spend_chosen=""
   fi
+  line2="${_line2_prefix}${_todo_chosen}${_line2_mid}${_spend_chosen}"
+else
+  line2="${_line2_prefix}${_line2_mid}"
+  # Suppress spend segment if it would cause line 2 to wrap.
+  if [ -n "$_spend_seg" ]; then
+    _line2_available=$(( _TERM_W_RAW - 3 ))
+    _len_without=$(( $(_visible_len "$line2") - 3 ))
+    _len_spend=$(_visible_len "$_spend_seg")
+
+    if [ "$_len_without" -le "$_line2_available" ] && \
+       [ $(( _len_without + _len_spend )) -gt "$_line2_available" ]; then
+      _spend_seg=""
+    fi
+  fi
+  [ -n "$_spend_seg" ] && line2+="$_spend_seg"
 fi
-[ -n "$_spend_seg" ] && line2+="$_spend_seg"
 
 # ── Output (§14) ──────────────────────────────────────────────────────────────
 printf '%s\n' "$line1"
