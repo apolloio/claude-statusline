@@ -4,11 +4,13 @@ Claude Code is powerful, but it can be hard to see what each prompt is costing y
 
 This custom statusline gives you that missing visibility — a compact two-line bar at the bottom of the terminal that turns usage data into a summary you can check at a glance.
 
-![Statusline screenshot](screenshot.png)
+<img src="screenshot-entreprise.png" alt="Enterprise statusline screenshot" width="100%">
+
+<img src="screenshot-pro-max.png" alt="Pro / Max statusline screenshot" width="100%">
 
 ## What it shows
 
-**Line 1:** Working directory · git branch · thinking indicator · model name · effort/fast-mode glyphs · colored context usage
+**Line 1:** Working directory · git branch · optional git-status markers · thinking indicator · model name · effort/fast-mode glyphs · colored context usage
 
 **Line 2:** Cache/latency dots · plan/budget segment · session cost · rolling 💸 spend windows (15m/1h/1d)
 
@@ -98,6 +100,15 @@ Or add it manually to `~/.claude/settings.json` as mentioned above.
 
 **Working directory and git branch** — orientation at a glance. Both are shortened to fit the terminal width: intermediate path segments shrink to their first letter, the last segment gets middle-ellipsis if needed (`~/P/a/claud(...)sline`). Branch is given priority space; the env vars `CLAUDE_STATUSLINE_CWD_MAXLEN` and `CLAUDE_STATUSLINE_BRANCH_MAXLEN` cap the maximum length.
 
+**Git status markers** (optional) — put a compact working-tree summary beside the branch. Set `CLAUDE_STATUSLINE_GIT_STATUS=dirty` to show changed files, or `on` to also show upstream divergence:
+
+- `+N` green — staged files
+- `!N` yellow — unstaged changes
+- `?N` dim — untracked files
+- `↑N` / `↓N` dim green/orange — commits ahead of or behind the upstream branch (`on` only)
+
+Markers are off by default, so the normal statusline performs no extra `git status` call. Set `CLAUDE_STATUSLINE_GIT_UNTRACKED=off` to hide untracked files (and speed up large repositories).
+
 **Model name** — which Claude model is active. 🧠 prefix when extended thinking is on; `↯` suffix when fast mode is enabled. Model choice is the single biggest lever on cost: Haiku is cheap and fast, Sonnet is balanced, Opus is powerful but expensive. Confirm you're not burning Opus credits on routine tasks.
 
 **Effort level** — how much reasoning work the model does before responding:
@@ -158,6 +169,8 @@ Colors are driven by per-window allowances computed from your remaining monthly 
 
 The 15m window is the sharpest signal: if it turns red, something expensive is happening right now (large agentic run, huge context, high effort). The 1d window catches slower cost drift.
 
+**Pro / Max usage** (`5h:82% ↻17:00  7d:7%  +💰$0.00/$1`) — shows short- and long-window utilization, with a local reset time once a window reaches 75%. When a window is exhausted, it remains identifiable as `5h:🪫100%` or `7d:🪫100%` and retains its reset time when available. The compact `+💰$used/$limit` badge previews or reports enabled extra usage; it appears once the 5h window reaches 75% by default, even before extra credits are spent. Use `CLAUDE_STATUSLINE_EXTRA_PREVIEW_PCT` (0–100) to change that threshold.
+
 ## Configuration
 
 All options are environment variables. Set them in the `env` block of `~/.claude/settings.json`.
@@ -189,6 +202,9 @@ Example configuration:
 | `CLAUDE_STATUSLINE_PERF_BADGE` | `on` \| `cache_only` \| `latency_only` \| `off` | `on` | Cache/latency dot cluster. |
 | `CLAUDE_STATUSLINE_ULTRACODE` | `on` \| `off` | `on` | Detect `/effort ultracode` from the session transcript and show the rainbow `ultracode` badge in place of the `xhigh` glyph. |
 | `CLAUDE_STATUSLINE_SHOW_PACE_RATIO` | `on` \| `off` | `on` | Show 🔥pace× in the monthly segment. |
+| `CLAUDE_STATUSLINE_GIT_STATUS` | `off` \| `dirty` \| `on` | `off` | Branch-adjacent git markers. `dirty` shows `+N`/`!N`/`?N`; `on` also shows `↑N`/`↓N` upstream divergence. |
+| `CLAUDE_STATUSLINE_GIT_UNTRACKED` | `on` \| `off` | `on` | Show the `?N` untracked-file marker when git status markers are enabled. |
+| `CLAUDE_STATUSLINE_EXTRA_PREVIEW_PCT` | `0`–`100` | `75` | Pro/Max 5h utilization at which to show the extra-usage badge, even with $0 used. |
 
 ### Line 1 display lengths
 
@@ -216,7 +232,7 @@ Example configuration:
 
 ## Plan support
 
-- **Pro / Max** — shows 5h and 7d session usage windows with reset times and optional extra-usage overflow.
+- **Pro / Max** — shows 5h and 7d session usage windows, reset times on high or fully exhausted windows, and the optional compact `+💰$used/$limit` extra-usage badge.
 - **Enterprise** — shows a monthly budget segment with workday-pace math and per-window allowances.
 
 ## Troubleshooting
