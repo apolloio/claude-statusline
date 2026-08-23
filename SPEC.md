@@ -120,6 +120,11 @@ All files live under `~/.claude/` by default. Set `CLAUDE_STATUSLINE_STATE_DIR` 
 **Locking:** serialize with mkdir-based lock (see §9).  
 **Row filtering in `calc_spent_all`:** only rows with `NF < 4` are skipped. All remaining rows are eligible regardless of `workspace_hash` — rolling windows reflect **global** spend across all workspaces, sessions, and instances.
 
+#### 4.1.1 Rolling-spend metrics cache
+**Path:** `~/.claude/statusline-spend-metrics.cache`
+**Purpose:** stores the six computed 15m/1h/1d spend and NODATA values so unchanged renders do not rescan the global usage log and session baselines.
+**Invalidation:** recompute when the high-resolution identity of either source file changes, or when the current session, normalized current cost, or local calendar day changes. The global usage log's 300-second heartbeat bounds time-only staleness when no other input changes. Corrupt or incompatible cache content is ignored and replaced atomically.
+
 ### 4.2 Session baselines
 **Path:** `~/.claude/statusline-session-baselines.tsv`  
 **Format:** TSV, 4 columns: `session_id  baseline_cost  first_seen_epoch  last_used_epoch`  
@@ -155,6 +160,11 @@ All files live under `~/.claude/` by default. Set `CLAUDE_STATUSLINE_STATE_DIR` 
 **Purpose:** Pro/Max plan utilization + Enterprise extra_usage budget.  
 **TTL:** `CACHE_TTL = 300 s`. Refresh triggered in background when `cache_age ≥ CACHE_TTL`.  
 **Stale threshold:** `cache_age ≥ 3 × CACHE_TTL` (≥15 min). Whether stale styling (⚠️, STRIKETHROUGH) is shown depends on the lock-age window — see §4.4.
+
+#### 4.3.2 OAuth derived caches
+**Paths:** `~/.claude/statusline-usage-fields.cache` and `~/.claude/statusline-usage-render.cache`
+**Purpose:** the fields cache stores the seven parsed JSON values used by Pro/Max and Enterprise displays; the render cache stores the final Enterprise monthly segment and rolling allowance values. This avoids repeated `jq`, calendar, pace, and money-format calculations while the OAuth response is unchanged.
+**Invalidation:** both caches key the source by inode, high-resolution mtime, and size, so replacement and same-size rewrites are detected. The Enterprise render additionally keys all display-affecting configuration, auth/stale state, locale decimal separator, and local day. Invalid or incompatible data is ignored and replaced atomically; no user migration is required.
 
 ### 4.4 OAuth fetch lock
 **Path:** `~/.claude/statusline-usage-fetch.lock`  

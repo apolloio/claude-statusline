@@ -80,8 +80,11 @@ _instance_key
 CARRY_FILE="$_CLAUDE_DIR/statusline-instance-carry.${_INSTANCE_KEY_RESULT}.cache"
 LOCK_DIR="$_CLAUDE_DIR/statusline-log.lock"
 USAGE_CACHE_FILE="$_CLAUDE_DIR/statusline-usage-cache.json"
+USAGE_FIELDS_FILE="$_CLAUDE_DIR/statusline-usage-fields.cache"
+USAGE_RENDER_FILE="$_CLAUDE_DIR/statusline-usage-render.cache"
 USAGE_FETCH_LOCK="$_CLAUDE_DIR/statusline-usage-fetch.lock"
 RUNWAY_CACHE_FILE="$_CLAUDE_DIR/statusline-runway-allowances.cache"
+SPEND_METRICS_FILE="$_CLAUDE_DIR/statusline-spend-metrics.cache"
 AUTH_ERROR_FILE="$_CLAUDE_DIR/statusline-usage-fetch.error"
 CACHE_TTL=300
 LOCK_INFLIGHT_GRACE=60    # lock_age < this → fetch in flight → suppress ⚠️
@@ -168,14 +171,21 @@ _fsize() {
   fi
 }
 
-# _file_identity path → inode<TAB>mtime<TAB>size.  Keep this together: transcript
-# caching needs all three values and three separate stat processes were surprisingly
-# visible in the statusline's hot path.
+# _file_identity path → inode|high-resolution-mtime|size|epoch-mtime. Keep
+# this together so cache keys need only one metadata snapshot and one stat.
 _file_identity() {
   if [[ "$OSTYPE" == darwin* || "$OSTYPE" == *bsd* ]]; then
-    stat -f '%i %m %z' "$1" 2>/dev/null || printf '0 0 0\n'
+    stat -f '%i|%Fm|%z|%m' "$1" 2>/dev/null || printf '0|0|0|0\n'
   else
-    stat -c '%i %Y %s' "$1" 2>/dev/null || printf '0 0 0\n'
+    stat -c '%i|%y|%s|%Y' "$1" 2>/dev/null || printf '0|0|0|0\n'
+  fi
+}
+
+_pair_identity() {
+  if [[ "$OSTYPE" == darwin* || "$OSTYPE" == *bsd* ]]; then
+    stat -f '%i|%Fm|%z' "$1" "$2" 2>/dev/null
+  else
+    stat -c '%i|%y|%s' "$1" "$2" 2>/dev/null
   fi
 }
 
@@ -253,7 +263,7 @@ _transcript_metrics() {
   local v ci cm cs offset cv lv hits total lsum lcount last_ts last_role uc used
   local sh st ss sn first_ts first_role slast_ts slast_role useen suc consumed sig siglen old_sig old_siglen
   local rebuild=0 append=0 locked=0
-  read -r inode mtime size < <(_file_identity "$path")
+  IFS='|' read -r inode mtime size _identity_epoch < <(_file_identity "$path")
   _path_hash "$path"; key=$_PATH_HASH_RESULT
   cache="$_CLAUDE_DIR/statusline-transcript-metrics.${key}.cache"
   lock="${cache}.lock"
@@ -1476,7 +1486,7 @@ fi
 # Phase 2 — read cache state
 cache_age=999999
 if [ -f "$USAGE_CACHE_FILE" ]; then
-  cache_mtime=$(_mtime "$USAGE_CACHE_FILE")
+  IFS='|' read -r cache_inode cache_identity_mtime cache_size cache_mtime < <(_file_identity "$USAGE_CACHE_FILE")
   cache_age=$(( NOW - ${cache_mtime:-0} ))
 fi
 
@@ -1521,19 +1531,26 @@ if [ "$_need_refresh" = "1" ]; then
   ( _fetch_usage_cache_bg & ) >/dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-
 fi
 
-# Parse cache fields — single jq pass
+# Parse cache fields once per source identity. The JSON is replaced atomically
+# by the fetcher, so inode + high-resolution mtime + size is a stable hot key.
 _fh_util="" _sd_util="" _fh_resets="" _sd_resets=""
 _ex_enabled="" _ex_used="" _ex_limit=""
 if [ -f "$USAGE_CACHE_FILE" ]; then
-  {
-    IFS= read -r _fh_util
-    IFS= read -r _sd_util
-    IFS= read -r _fh_resets
-    IFS= read -r _sd_resets
-    IFS= read -r _ex_enabled
-    IFS= read -r _ex_used
-    IFS= read -r _ex_limit
-  } < <(jq -r '
+  _usage_fields_hit=0
+  if [ -f "$USAGE_FIELDS_FILE" ]; then
+    {
+      IFS= read -r _uf_version; IFS= read -r _uf_inode; IFS= read -r _uf_mtime; IFS= read -r _uf_size
+      IFS= read -r _fh_util; IFS= read -r _sd_util; IFS= read -r _fh_resets; IFS= read -r _sd_resets
+      IFS= read -r _ex_enabled; IFS= read -r _ex_used; IFS= read -r _ex_limit
+      IFS= read -r _uf_complete
+    } < "$USAGE_FIELDS_FILE"
+    [ "$_uf_version" = 2 ] && [ "$_uf_complete" = complete ] && [ "$_uf_inode" = "$cache_inode" ] && [ "$_uf_mtime" = "$cache_identity_mtime" ] && [ "$_uf_size" = "$cache_size" ] && _usage_fields_hit=1
+  fi
+  if [ "$_usage_fields_hit" = 0 ]; then
+    {
+      IFS= read -r _fh_util; IFS= read -r _sd_util; IFS= read -r _fh_resets; IFS= read -r _sd_resets
+      IFS= read -r _ex_enabled; IFS= read -r _ex_used; IFS= read -r _ex_limit
+    } < <(jq -r '
       ((.five_hour.utilization // null) | if . then (. + 0.5 | floor | tostring) else "" end),
       ((.seven_day.utilization // null) | if . then (. + 0.5 | floor | tostring) else "" end),
       (.five_hour.resets_at // ""),
@@ -1542,6 +1559,9 @@ if [ -f "$USAGE_CACHE_FILE" ]; then
       (.extra_usage.used_credits // ""),
       (.extra_usage.monthly_limit // "")
     ' "$USAGE_CACHE_FILE" 2>/dev/null)
+    _uf_tmp="$USAGE_FIELDS_FILE.$_TMP_TAG.tmp"
+    printf '2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\ncomplete\n' "$cache_inode" "$cache_identity_mtime" "$cache_size" "$_fh_util" "$_sd_util" "$_fh_resets" "$_sd_resets" "$_ex_enabled" "$_ex_used" "$_ex_limit" > "$_uf_tmp" && mv "$_uf_tmp" "$USAGE_FIELDS_FILE"
+  fi
 fi
 
 # Auth error flag — computed once, used in multiple sections below
@@ -1605,9 +1625,29 @@ if [ -n "$_fh_util" ]; then
 fi
 
 # ── Enterprise monthly display (§8.4) ─────────────────────────────────────────
-_allow_1h="" _allow_1d=""
+_allow_15m="" _allow_1h="" _allow_1d=""
+_oauth_render_hit=0 _oauth_render_enterprise=0 _oauth_render_key=""
 
+# Enterprise rendering includes calendar, pace, runway, and monetary work. Cache
+# its final bytes until the OAuth source, local day, or display inputs change.
 if [ -z "$_fh_util" ] && [ "$_ex_enabled" = "true" ] && [ -n "$_ex_limit" ]; then
+  _oauth_render_enterprise=1
+  _oauth_render_key="1|${cache_inode:-}|${cache_identity_mtime:-}|${cache_size:-}|$_auth_error|$_usage_cache_stale|$loadavg_mode|$sign_mode|$show_pace_ratio|$hours_per_day|$work_days_str|$holidays_raw|$DECIMAL_POINT|$_DAY_START"
+  if [ -f "$USAGE_RENDER_FILE" ]; then
+    {
+      IFS= read -r _ur_version; IFS= read -r _ur_key; IFS= read -r _ur_monthly
+      IFS= read -r _ur_15m; IFS= read -r _ur_1h; IFS= read -r _ur_1d
+      IFS= read -r _ur_complete
+    } < "$USAGE_RENDER_FILE"
+    if [ "$_ur_version" = 2 ] && [ "$_ur_complete" = complete ] && [ -n "$_ur_monthly" ] && [ "$_ur_key" = "$_oauth_render_key" ]; then
+      monthly_seg=$_ur_monthly
+      _allow_15m=$_ur_15m _allow_1h=$_ur_1h _allow_1d=$_ur_1d
+      _oauth_render_hit=1
+    fi
+  fi
+fi
+
+if [ "$_oauth_render_enterprise" = 1 ] && [ "$_oauth_render_hit" = 0 ]; then
   _ex_used_v="${_ex_used:-0}"
   _ex_limit_v="${_ex_limit:-1}"
 
@@ -1757,6 +1797,13 @@ if [ -z "$_fh_util" ] && [ "$_ex_enabled" = "true" ] && [ -n "$_ex_limit" ]; the
 fi
 
 # ── Line 2 assembly (§10) ──────────────────────────────────────────────────────
+if [ "$_oauth_render_enterprise" = 1 ] && [ "$_oauth_render_hit" = 0 ]; then
+  _ur_tmp="$USAGE_RENDER_FILE.$_TMP_TAG.tmp"
+  printf '2\n%s\n%s\n%s\n%s\n%s\ncomplete\n' \
+    "$_oauth_render_key" "$monthly_seg" "$_allow_15m" "$_allow_1h" "$_allow_1d" \
+    > "$_ur_tmp" && mv "$_ur_tmp" "$USAGE_RENDER_FILE"
+fi
+
 # §10 item 1: leading ZWSP + two spaces
 line2="${SPACE}  "
 
@@ -1792,7 +1839,21 @@ fi
 # §10 item 9: rolling 💸 windows — built into _spend_seg for adaptive truncation
 _spend_seg=""
 if [ "$loadavg_mode" != "off" ] && [ -f "$LOG_FILE" ]; then
-  read -r s15 s1h s1d nd15 nd1h nd1d < <(calc_spent_all)
+  _spend_bfile="$BASELINE_FILE"; [ -f "$_spend_bfile" ] || _spend_bfile=/dev/null
+  { IFS= read -r _spend_log_id; IFS= read -r _spend_base_id; } < <(_pair_identity "$LOG_FILE" "$_spend_bfile")
+  _spend_key="${_spend_log_id}|${_spend_base_id}|${session_id}|${cost_6f}|${_DAY_START}"
+  _spend_hit=0
+  if [ -f "$SPEND_METRICS_FILE" ]; then
+    { IFS= read -r _spend_version; IFS= read -r _spend_cached_key; read -r s15 s1h s1d nd15 nd1h nd1d; IFS= read -r _spend_complete; } < "$SPEND_METRICS_FILE"
+    if [ "$_spend_version" = 2 ] && [ "$_spend_complete" = complete ] && [ "$_spend_cached_key" = "$_spend_key" ]; then
+      case "$nd15$nd1h$nd1d" in [01][01][01]) _spend_hit=1 ;; esac
+    fi
+  fi
+  if [ "$_spend_hit" = 0 ]; then
+    read -r s15 s1h s1d nd15 nd1h nd1d < <(calc_spent_all)
+    _spend_tmp="$SPEND_METRICS_FILE.$_TMP_TAG.tmp"
+    printf '2\n%s\n%s %s %s %s %s %s\ncomplete\n' "$_spend_key" "$s15" "$s1h" "$s1d" "$nd15" "$nd1h" "$nd1d" > "$_spend_tmp" && mv "$_spend_tmp" "$SPEND_METRICS_FILE"
+  fi
   # Allowances for 15m/1h/1d (Enterprise + loadavg=on only)
   _r_allow_15m="" _r_allow_1h="" _r_allow_1d=""
   if [ "$loadavg_mode" = "on" ] && [ -n "$_allow_1h" ] && [ "$_auth_error" != "1" ]; then
