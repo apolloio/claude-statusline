@@ -484,47 +484,78 @@ fmt_ctx_k() {
 
 # ── Persistent state (§4.1, §4.2) ─────────────────────────────────────────────
 NOW=$(date +%s)
-ws_hash=$(workspace_hash "$cwd")
-
-# Session ID fallback (§13)
 [ -z "$session_id" ] && session_id="anon"
-
-# Initialize baseline_cost to current cost (no-baseline fallback)
 mkdir -p "$_CLAUDE_DIR"
-baseline_cost="$cost"
 
-if _acquire_lock; then
+# Carry lines 1-3 are the original public format.  Lines 4-8 are a lazy,
+# backward-compatible hot-path cache for the baseline and log metadata.
+_cf_sid="" _cf_pcost="" _cf_carry="0" _cf_baseline="" _cf_touch="0"
+_cf_log_time="0" _cf_cwd="" _cf_ws_hash=""
+_first_instance_render=0
+if [ -f "$CARRY_FILE" ]; then
+  {
+    IFS= read -r _cf_sid; IFS= read -r _cf_pcost; IFS= read -r _cf_carry
+    IFS= read -r _cf_baseline; IFS= read -r _cf_touch; IFS= read -r _cf_log_time
+    IFS= read -r _cf_cwd; IFS= read -r _cf_ws_hash
+  } < "$CARRY_FILE"
+else
+  _first_instance_render=1
+fi
+: "${_cf_carry:=0}" "${_cf_touch:=0}" "${_cf_log_time:=0}"
+
+baseline_cost="$cost"
+_baseline_due=1
+if [ "$_cf_sid" = "$session_id" ] && [ -n "$_cf_baseline" ]; then
+  baseline_cost="$_cf_baseline"
+  _baseline_due=0
+  [ $(( NOW - _cf_touch )) -ge 86400 ] 2>/dev/null && _baseline_due=1
+fi
+
+_log_due=0
+[ "$_cf_sid" != "$session_id" ] && _log_due=1
+[ "$_cf_pcost" != "$cost_6f" ] && _log_due=1
+[ "$_cf_cwd" != "$cwd" ] && _log_due=1
+[ $(( NOW - _cf_log_time )) -ge 300 ] 2>/dev/null && _log_due=1
+ws_hash="$_cf_ws_hash"
+
+if { [ "$_baseline_due" = 1 ] || [ "$_log_due" = 1 ]; } && _acquire_lock; then
   trap _release_lock EXIT
 
   # ── Session baseline upsert (§4.2) ─────────────────────────────────────────
-  existing_baseline=""
-  [ -f "$BASELINE_FILE" ] && \
-    existing_baseline=$(awk -F'\t' -v sid="$session_id" '$1==sid{print $2;exit}' "$BASELINE_FILE")
-
-  if [ -n "$existing_baseline" ]; then
-    baseline_cost="$existing_baseline"
+  if [ "$_baseline_due" = 1 ]; then
+    existing_baseline=""
+    [ -f "$BASELINE_FILE" ] && existing_baseline=$(awk -F'\t' -v sid="$session_id" '$1==sid{print $2;exit}' "$BASELINE_FILE")
     cutoff_30d=$(( NOW - BASELINE_TTL ))
     _bt="$BASELINE_FILE.$_TMP_TAG.tmp"
-    if [ $(( RANDOM % 100 )) -eq 0 ]; then
+    if [ -n "$existing_baseline" ]; then
+      baseline_cost="$existing_baseline"
       awk -F'\t' -v OFS='\t' -v sid="$session_id" -v now="$NOW" -v cutoff="$cutoff_30d" '
         $1==sid { $4=now }
         $4+0 >= cutoff { print }
       ' "$BASELINE_FILE" > "$_bt" && [ -s "$_bt" ] && mv "$_bt" "$BASELINE_FILE" || rm -f "$_bt"
     else
-      awk -F'\t' -v OFS='\t' -v sid="$session_id" -v now="$NOW" '
-        $1==sid { $4=now }
-        { print }
-      ' "$BASELINE_FILE" > "$_bt" && [ -s "$_bt" ] && mv "$_bt" "$BASELINE_FILE" || rm -f "$_bt"
+      baseline_cost="$cost"
+      if [ -f "$BASELINE_FILE" ]; then
+        awk -F'\t' -v cutoff="$cutoff_30d" '$4+0 >= cutoff' "$BASELINE_FILE" > "$_bt" || :
+        printf '%s\t%s\t%d\t%d\n' "$session_id" "$cost_6f" "$NOW" "$NOW" >> "$_bt"
+        mv "$_bt" "$BASELINE_FILE"
+      else
+        printf '%s\t%s\t%d\t%d\n' "$session_id" "$cost_6f" "$NOW" "$NOW" > "$BASELINE_FILE"
+      fi
     fi
-  else
-    baseline_cost="$cost"
-    printf '%s\t%.6f\t%d\t%d\n' "$session_id" "$cost_6f" "$NOW" "$NOW" >> "$BASELINE_FILE"
+    _cf_touch="$NOW"
   fi
 
   # ── Global usage log append + prune (§4.1) ─────────────────────────────────
-  printf '%d %s %s %s\n' "$NOW" "$session_id" "$cost_6f" "$ws_hash" >> "$LOG_FILE"
+  if [ "$_log_due" = 1 ]; then
+    if [ "$cwd" != "$_cf_cwd" ] || [ -z "$ws_hash" ]; then
+      ws_hash=$(workspace_hash "$cwd")
+    fi
+    printf '%d %s %s %s\n' "$NOW" "$session_id" "$cost_6f" "$ws_hash" >> "$LOG_FILE"
+    _cf_log_time="$NOW"
+  fi
 
-  if [ "$(_fsize "$LOG_FILE")" -gt "$LOG_PRUNE_SIZE_MAX" ]; then
+  if [ "$_log_due" = 1 ] && [ "$(_fsize "$LOG_FILE")" -gt "$LOG_PRUNE_SIZE_MAX" ]; then
     _lt="$LOG_FILE.$_TMP_TAG.tmp"
     cutoff_36h=$(( NOW - LOG_PRUNE_WINDOW ))
     awk -v cutoff="$cutoff_36h" '
@@ -555,8 +586,7 @@ session_cost=$(awk -v inst="$cost" -v base="$baseline_cost" \
 # session_id. We detect this (session change or cost decrease) and accumulate the
 # pre-/clear cost so ∑ⁱ reflects total spend across all /clears this process.
 instance_carry=0
-if [ -f "$CARRY_FILE" ]; then
-  { IFS= read -r _cf_sid; IFS= read -r _cf_pcost; IFS= read -r _cf_carry; } < "$CARRY_FILE"
+if [ "$_first_instance_render" = 0 ]; then
   if [ "$_cf_sid" = "$session_id" ] && \
      awk -v c="$cost_6f" -v p="${_cf_pcost:-0}" 'BEGIN{exit (c+0 >= p+0 - 0.001 ? 0 : 1)}'; then
     instance_carry="${_cf_carry:-0}"
@@ -568,9 +598,13 @@ else
   # First render for this instance: reap dead instances' carry files and the
   # pre-fix global one (which caused stale carry to leak across instances).
   find "$_CLAUDE_DIR" -maxdepth 1 -name 'statusline-instance-carry.*.cache' -mtime +1 -delete 2>/dev/null
+  find "$_CLAUDE_DIR" -maxdepth 1 -name 'statusline-transcript-metrics.*.cache' -mtime +7 -delete 2>/dev/null
   rm -f "$_CLAUDE_DIR/statusline-instance-carry.cache"
 fi
-printf '%s\n%s\n%s\n' "$session_id" "$cost_6f" "$instance_carry" > "$CARRY_FILE"
+_carry_new=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$session_id" "$cost_6f" "$instance_carry" "$baseline_cost" "$_cf_touch" "$_cf_log_time" "$cwd" "$ws_hash")
+_carry_old=""
+[ -f "$CARRY_FILE" ] && _carry_old=$(<"$CARRY_FILE")
+[ "$_carry_new" = "$_carry_old" ] || printf '%s\n' "$_carry_new" > "$CARRY_FILE"
 instance_cost=$(awk -v carry="$instance_carry" -v sess="$session_cost" \
   'BEGIN{printf "%.6f", carry+0 + sess+0}')
 
