@@ -140,6 +140,164 @@ _mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0;
 # _fsize(path) — file size in bytes (GNU -c %s first, BSD -f %z fallback)
 _fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0; }
 
+# _file_identity path → inode<TAB>mtime<TAB>size.  Keep this together: transcript
+# caching needs all three values and three separate stat processes were surprisingly
+# visible in the statusline's hot path.
+_file_identity() {
+  if [[ "$OSTYPE" == darwin* || "$OSTYPE" == *bsd* ]]; then
+    stat -f '%i %m %z' "$1" 2>/dev/null || printf '0 0 0\n'
+  else
+    stat -c '%i %Y %s' "$1" 2>/dev/null || printf '0 0 0\n'
+  fi
+}
+
+# _transcript_raw_metrics reads complete JSONL records from stdin and prints
+# hits, total, latency sum/count, final event and raw-substring ultracode state.
+# The raw matching is intentional: it preserves the documented last-event-wins
+# behaviour for attachment text without changing existing ultracode semantics.
+_transcript_raw_metrics() {
+  jq -Rrs '
+    def role:
+      if (.type == "user" or .type == "human") then "user"
+      elif .type == "assistant" then "assistant"
+      elif ((.message.role // .role // "") == "user" or (.message.role // .role // "") == "human") then "user"
+      elif ((.message.role // .role // "") == "assistant") then "assistant"
+      else null end;
+    def number_ts:
+      if type == "number" then .
+      elif type == "string" then tonumber? else null end
+      | if . == null then null else until(. <= 9999999999; . / 1000) end;
+    def iso_ts:
+      sub("\\.[0-9]+(?=(Z|[+-][0-9]{2}:[0-9]{2})$)"; "")
+      | capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<zone>Z|(?<sign>[+-])(?<oh>[0-9]{2}):(?<om>[0-9]{2}))$")?
+      | if . == null then null else
+          (.base | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $base
+          | if .zone == "Z" then $base else
+              ((.oh|tonumber) * 3600 + (.om|tonumber) * 60) as $off
+              | $base + (if .sign == "+" then -$off else $off end)
+            end
+        end;
+    def ts:
+      .timestamp as $t |
+      if ($t == null or ($t|type) == "boolean") then null
+      elif ($t|type) == "number" then ($t|number_ts)
+      elif ($t|type) == "string" then
+        (($t | iso_ts) // ($t|number_ts))
+      elif ($t|type) == "object" then
+        ($t.unix // $t.seconds // $t.sec // $t.time // $t.milliseconds // $t.ms // null | number_ts)
+      else null end;
+    . as $raw |
+    ($raw | rindex("\n")) as $nl |
+    (if $nl == null then "" else $raw[0:$nl + 1] end) as $complete |
+    ($complete | split("\n")[:-1]) as $lines |
+    [$lines[] | {raw: ., o: fromjson?} | select(.o != null)] as $rows |
+    (reduce $rows[] as $r ({h:0,t:0};
+      ($r.o.message.usage // $r.o.toolUseResult.usage // null) as $u |
+      if $u == null then . else .h += ($u.cache_read_input_tokens // 0) | .t += (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0) + ($u.cache_read_input_tokens // 0)) end)) as $tokens |
+    [$rows | to_entries[] | . as $e | ($e.value.o | role) as $r | ($e.value.o | ts) as $t | select($r != null and $t != null) | {r:$r,t:$t,i:$e.key}] | sort_by(.t,.i) as $events |
+    (reduce $events[] as $e ({sum:0,n:0,prev:null};
+      if (.prev != null and .prev.r == "user" and $e.r == "assistant") then
+        ($e.t - .prev.t) as $d | if $d > 0 and $d < 86400 then .sum += $d | .n += 1 else . end
+      else . end | .prev = $e)) as $lat |
+    (reduce $rows[] as $r ({seen:0,state:0};
+      if ($r.raw|contains("\"type\":\"ultra_effort_enter\"")) then {seen:1,state:1}
+      elif ($r.raw|contains("\"type\":\"ultra_effort_exit\"")) then {seen:1,state:0}
+      else . end)) as $uc |
+    [ $tokens.h, $tokens.t, $lat.sum, $lat.n,
+      ($events[0].t // "-"), ($events[0].r // "-"),
+      ($lat.prev.t // "-"), ($lat.prev.r // "-"),
+      $uc.seen, $uc.state, ($complete|utf8bytelength) ] | @tsv
+  ' 2>/dev/null
+}
+
+# Shared, incremental transcript cache.  Cache payload is deliberately plain
+# TSV for Bash 3.2 portability; line 1 is a schema/version guard.
+_transcript_metrics() {
+  local path="$1" need_cache="$2" need_latency="$3" inode mtime size key cache lock
+  local v ci cm cs offset cv lv hits total lsum lcount last_ts last_role uc used
+  local sh st ss sn first_ts first_role slast_ts slast_role useen suc consumed
+  local rebuild=0 append=0 locked=0
+  read -r inode mtime size < <(_file_identity "$path")
+  key=$(workspace_hash "$path")
+  cache="$_CLAUDE_DIR/statusline-transcript-metrics.${key}.cache"
+  lock="${cache}.lock"
+  if [ -f "$cache" ]; then
+    {
+      IFS= read -r v; IFS= read -r ci; IFS= read -r cm; IFS= read -r cs; IFS= read -r offset
+      IFS= read -r cv; IFS= read -r lv; IFS= read -r hits; IFS= read -r total
+      IFS= read -r lsum; IFS= read -r lcount; IFS= read -r last_ts; IFS= read -r last_role
+      IFS= read -r uc; IFS= read -r used
+    } < "$cache"
+    if [ "$v" != "3" ] || [ "$ci" != "$inode" ] ||
+       ! [[ "$cs" =~ ^[0-9]+$ && "$offset" =~ ^[0-9]+$ && "$hits" =~ ^[0-9]+([.][0-9]+)?$ && "$total" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+       [ "$size" -lt "$offset" ] 2>/dev/null; then
+      rebuild=1
+    elif [ "$size" -eq "$cs" ] 2>/dev/null; then
+      [ "$mtime" = "$cm" ] || rebuild=1
+    else
+      append=1
+    fi
+  else
+    rebuild=1
+  fi
+
+  [ "$need_cache" = 1 ] && [ "${cv:-0}" != 1 ] && rebuild=1
+  [ "$need_latency" = 1 ] && [ "${lv:-0}" != 1 ] && rebuild=1
+
+  if [ "$rebuild" = 0 ] && [ "$append" = 0 ]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "$hits" "$total" "$lsum" "$lcount" "$uc"
+    return
+  fi
+
+  # Serialize updates briefly.  Contention never blocks the prompt: after two
+  # attempts, compute a correct uncached result and leave the winner's cache alone.
+  mkdir "$lock" 2>/dev/null && locked=1
+  if [ "$locked" = 0 ]; then
+    sleep 0.02
+    mkdir "$lock" 2>/dev/null && locked=1
+  fi
+  if [ "$locked" = 0 ]; then
+    IFS=$'\t' read -r hits total lsum lcount first_ts first_role last_ts last_role useen uc consumed < <(_transcript_raw_metrics < "$path")
+    printf '%s\t%s\t%s\t%s\t%s\n' "${hits:-0}" "${total:-0}" "${lsum:-0}" "${lcount:-0}" "${uc:-0}"
+    return
+  fi
+
+  if [ "$append" = 1 ]; then
+    IFS=$'\t' read -r sh st ss sn first_ts first_role slast_ts slast_role useen suc consumed < <(tail -c "+$(( offset + 1 ))" "$path" 2>/dev/null | _transcript_raw_metrics)
+    : "${sh:=0}" "${st:=0}" "${ss:=0}" "${sn:=0}" "${useen:=0}" "${consumed:=0}"
+    if [ "$first_ts" != - ] && [ "$last_ts" != - ] && awk -v a="$first_ts" -v b="$last_ts" 'BEGIN{exit(a<b?0:1)}'; then
+      rebuild=1
+    else
+      hits=$(awk -v a="$hits" -v b="$sh" 'BEGIN{print a+b}')
+      total=$(awk -v a="$total" -v b="$st" 'BEGIN{print a+b}')
+      lsum=$(awk -v a="$lsum" -v b="$ss" 'BEGIN{print a+b}')
+      lcount=$(( ${lcount:-0} + ${sn:-0} ))
+      if [ "$last_role" = user ] && [ "$first_role" = assistant ]; then
+        _boundary=$(awk -v a="$first_ts" -v b="$last_ts" 'BEGIN{d=a-b; if(d>0&&d<86400) print d}')
+        if [ -n "$_boundary" ]; then
+          lsum=$(awk -v a="$lsum" -v b="$_boundary" 'BEGIN{print a+b}')
+          lcount=$(( lcount + 1 ))
+        fi
+      fi
+      [ "$slast_ts" != - ] && { last_ts="$slast_ts"; last_role="$slast_role"; }
+      [ "$useen" = 1 ] && uc="$suc"
+      offset=$(( offset + consumed ))
+    fi
+  fi
+  if [ "$rebuild" = 1 ]; then
+    IFS=$'\t' read -r hits total lsum lcount first_ts first_role last_ts last_role useen uc consumed < <(_transcript_raw_metrics < "$path")
+    offset=${consumed:-0}
+  fi
+  : "${hits:=0}" "${total:=0}" "${lsum:=0}" "${lcount:=0}" "${uc:=0}"
+  cv=$(( ${cv:-0} || need_cache )); lv=$(( ${lv:-0} || need_latency ))
+  _tm_tmp="$cache.$_TMP_TAG.tmp"
+  printf '3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$inode" "$mtime" "$size" "$offset" "$cv" "$lv" "$hits" "$total" "$lsum" "$lcount" "$last_ts" "$last_role" "$uc" "$NOW" > "$_tm_tmp" && mv "$_tm_tmp" "$cache"
+  rmdir "$lock" 2>/dev/null
+  if [ "$need_cache" = 0 ]; then hits=0; total=0; fi
+  if [ "$need_latency" = 0 ]; then lsum=0; lcount=0; fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$hits" "$total" "$lsum" "$lcount" "$uc"
+}
+
 # _env_opt VAR_NAME default val1 val2 … — case-fold + validate env var (bash 3.2 safe)
 _env_opt() {
   local _var="$1" _def="$2"; shift 2
@@ -423,6 +581,7 @@ sign_mode=$(_env_opt CLAUDE_STATUSLINE_BUDGET_SIGN_MODE neutral neutral used_min
 show_pace_ratio=$(_env_opt CLAUDE_STATUSLINE_SHOW_PACE_RATIO on on off)
 git_status_mode=$(_env_opt CLAUDE_STATUSLINE_GIT_STATUS off off dirty on)
 git_untracked_mode=$(_env_opt CLAUDE_STATUSLINE_GIT_UNTRACKED on on off)
+perf_mode=$(_env_opt CLAUDE_STATUSLINE_PERF_BADGE on on off cache_only latency_only)
 
 hours_per_day="${CLAUDE_STATUSLINE_BUDGET_HOURS_PER_DAY:-6}"
 awk -v h="$hours_per_day" 'BEGIN { exit (h+0 > 0 ? 0 : 1) }' </dev/null 2>/dev/null || hours_per_day=6
@@ -654,14 +813,12 @@ _TERM_W_RAW=$_TERM_W   # save pre-floor value for line 2 adaptive truncation
 # user prompt is built, so a fresh toggle shows up one prompt late. Switch to a jq pass on
 # .attachment.type if either bites.
 _ultracode=0
-if [ "$ultracode_mode" != "off" ] && [ "$effort_level" = "xhigh" ] && \
-   [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -r "$transcript_path" ]; then
-  _ultracode=$(awk '
-    /"type":"ultra_effort_enter"/ { s = 1 }
-    /"type":"ultra_effort_exit"/  { s = 0 }
-    END { print s + 0 }
-  ' "$transcript_path" 2>/dev/null)
-  [ "$_ultracode" = "1" ] || _ultracode=0
+_tm_cache=0 _tm_latency=0 _tm_need_uc=0
+case "$perf_mode" in on) _tm_cache=1; _tm_latency=1 ;; cache_only) _tm_cache=1 ;; latency_only) _tm_latency=1 ;; esac
+[ "$ultracode_mode" != "off" ] && [ "$effort_level" = "xhigh" ] && _tm_need_uc=1
+if { [ "$_tm_cache" = 1 ] || [ "$_tm_latency" = 1 ] || [ "$_tm_need_uc" = 1 ]; } && [ -r "$transcript_path" ]; then
+  IFS=$'\t' read -r _tm_hits _tm_total _tm_sum _tm_count _tm_uc < <(_transcript_metrics "$transcript_path" "$_tm_cache" "$_tm_latency")
+  [ "$_tm_need_uc" = 1 ] && [ "$_tm_uc" = 1 ] && _ultracode=1
 fi
 
 # Estimate chars consumed by fixed elements (model, effort, fast, thinking, ctx, leading space).
@@ -866,8 +1023,6 @@ else
 fi
 
 # ── Performance badge computation (§8.1, §3.1) ────────────────────────────────
-perf_mode=$(_env_opt CLAUDE_STATUSLINE_PERF_BADGE on on off cache_only latency_only)
-
 _perf_level_for_cache() {
   awk -v r="$1" 'BEGIN {
     if (r == "") { print -1; exit }
@@ -907,7 +1062,11 @@ _build_perf_badge() {
 perf_badge=""
 if [ "$perf_mode" != "off" ]; then
   hit_rate="" avg_resp=""
-  if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -r "$transcript_path" ]; then
+  if [ -n "$transcript_path" ] && [ -r "$transcript_path" ] && [ -n "${_tm_total:-}" ]; then
+    [ "$_tm_total" -gt 0 ] 2>/dev/null && hit_rate=$(awk -v h="$_tm_hits" -v t="$_tm_total" 'BEGIN { print h * 100 / t }')
+    [ "$_tm_count" -gt 0 ] 2>/dev/null && avg_resp=$(awk -v s="$_tm_sum" -v n="$_tm_count" 'BEGIN { print s / n }')
+  fi
+  if [ -z "${_tm_total:-}" ] && [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -r "$transcript_path" ]; then
     signals=$(jq -rs '
       def usage: (.message.usage // .toolUseResult.usage // null);
       def ts:
