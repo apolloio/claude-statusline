@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Faster statusline refreshes:** Repeated renders now avoid rescanning unchanged transcript history and skip duplicate state-file writes. Large transcripts, Git workspaces, and plan/budget displays respond substantially faster. Response timing also now accepts every documented role and timestamp form, including fractional ISO timestamps and timezone offsets.
 - **Burned 5h/7d window keeps label and reset time:** The `🪫100%` badge (shown when your Pro/Max 5h or 7d window is fully burned) now keeps its `5h:`/`7d:` label and still shows the `↻HH:MM` reset time when available, instead of dropping both.
 - **Git status markers:** Set CLAUDE_STATUSLINE_GIT_STATUS to dirty or on to show working-tree state next to the branch name — `+N` (green) for files with staged changes, `!N` (yellow) for files with unstaged changes, `?N` (dimmed) for untracked files, and dimmed `↑`/`↓` counts (green/orange) for commits ahead of or behind your upstream. Off by default. CLAUDE_STATUSLINE_GIT_UNTRACKED=off hides the `?N` marker.
 - **Ultracode indicator:** `/effort ultracode` now shows as a rainbow-colored `ultracode` badge on line 1 instead of being indistinguishable from `xhigh`. Claude Code reports ultracode as plain `xhigh` in the statusline data, so the level is inferred from the transcript instead. Two caveats: a freshly switched level shows up one prompt late, and the badge only ever appears while the effort level is `xhigh`. Set `CLAUDE_STATUSLINE_ULTRACODE=off` to disable.
