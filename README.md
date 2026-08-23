@@ -1,8 +1,23 @@
 # claude-statusline
 
+[![License](https://img.shields.io/github/license/apolloio/claude-statusline)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/apolloio/claude-statusline)](https://github.com/apolloio/claude-statusline/stargazers)
+[![Shell](https://img.shields.io/badge/shell-bash%203.2%2B-89e051)](statusline-command.sh)
+
+A two-line Claude Code statusline that turns raw usage data into an at-a-glance read: context left, session cost, rolling spend, cache health, and plan/budget standing — all in one `bash` script.
+
 Claude Code is powerful, but it can be hard to see what each prompt is costing you. Tokens add up quietly in the background, and you often only notice after a session runs long, a "quick" task turns into a $10 detour, or you've burned through too much of your monthly budget in the first week.
 
 This custom statusline gives you that missing visibility — a compact two-line bar at the bottom of the terminal that turns usage data into a summary you can check at a glance.
+
+## Why this one
+
+- **Almost no dependencies.** Just [`jq`](https://jqlang.org/) — everything else (`awk`, `curl`, `git`, `stat`, `date`, `security`) ships with macOS/Linux already. No npm install, no plugin runtime, no background daemon.
+- **One file.** The entire thing is a single `statusline-command.sh` you can read top to bottom, `diff` against upstream, or fork in five minutes. Nothing to build, nothing to compile.
+- **Fast.** It runs on every prompt, so the script is written to minimize forked subprocesses (single `jq` pass, cached state files, no repeated `git`/`stat` calls) — you won't feel it in your prompt latency.
+- **Cost-aware, not just activity-aware.** Rolling 15m/1h/1d spend windows, per-session and per-instance cost totals, and Pro/Max/Enterprise budget tracking with reset times — built for people who actually want to watch the bill, not just see that Claude is "doing something."
+- **Battle-tested edge cases.** Handles `/clear` resets, dead sessions, stale locks, narrow terminals, and bash 3.2 (the version macOS still ships) without special setup.
+- **Looks good out of the box.** Color-coded context %, git branch/status, cache/latency dots, and budget bars — legible at a glance, no theme configuration required.
 
 <img src="screenshot-entreprise.png" alt="Enterprise statusline screenshot" width="100%">
 
