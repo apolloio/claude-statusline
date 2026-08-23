@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Todo progress:** Set CLAUDE_STATUSLINE_TODOS=on to show checklist progress on line 2 — a completed/total count plus the task currently in progress. The task text is dropped automatically on narrow terminals, or always with CLAUDE_STATUSLINE_TODOS=counts. CLAUDE_STATUSLINE_TODO_MAXLEN caps its length (default 32). Off by default; hidden when a session has no tasks or all are complete.
 - **∑ⁱ scoped per instance:** Fixed a bug where a newly opened Claude Code instance could show a large, unexpected ∑ⁱ total inherited from another instance's accumulated cost. ∑ⁱ now starts at zero for each new instance and only accumulates its own pre-/clear cost.
 - **∑ⁱ restored after `/clear`:** Claude Code 2.1.211 fixed `/clear` to properly reset `cost.total_cost_usd` to zero, which had the side-effect of breaking the ∑ⁱ instance-total badge (it disappeared after every `/clear`). The statusline now carries the pre-/clear cost forward in a small cache file, so ∑ⁱ correctly shows the full cost since the current Claude Code process started. The fix is backward-compatible with older Claude Code versions.
 - **Accurate shared daily spend across instances:** The 💸 1d window now reliably reflects combined spend across all running Claude sessions, even when several instances write at once. Previously concurrent instances could corrupt the shared spend log and cause 1d to under-report (sometimes toward $0).

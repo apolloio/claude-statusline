@@ -62,6 +62,7 @@ All value strings are case-insensitive; unrecognized values fall back to `on`.
 | `CLAUDE_STATUSLINE_COST_LOADAVG` | `on` \| `spent_only` \| `off` | `on` | Rolling 💸 window behavior. `on` shows allowance suffix on 1h/1d; `spent_only` shows spent amounts only; `off` hides the whole 💸 segment and skips its computation. |
 | `CLAUDE_STATUSLINE_PERF_BADGE` | `on` \| `cache_only` \| `latency_only` \| `off` | `on` | Performance dots. `cache_only` skips response-time scan; `latency_only` skips cache-token scan; `off` skips all transcript I/O. |
 | `CLAUDE_STATUSLINE_SHOW_PACE_RATIO` | `on` \| `off` | `on` | Show 🔥pace× in Enterprise monthly segment |
+| `CLAUDE_STATUSLINE_TODOS` | `off` \| `counts` \| `on` | `off` | Todo/task progress segment on line 2 (§10.1). `off`: no segment, no `~/.claude/tasks/` read. `counts`: always `☑ completed/total`, never the item text. `on`: adaptive — item text when line 2 has room, counts-only when it doesn't. |
 
 ### 3.2 Context window thresholds
 
@@ -88,6 +89,7 @@ All value strings are case-insensitive; unrecognized values fall back to `on`.
 |---|---|---------|---|
 | `CLAUDE_STATUSLINE_CWD_MAXLEN` | integer ≥ 8 | `64`    | Hard ceiling on visible CWD length (chars). Actual length may be less based on terminal width. Invalid values (non-integer or < 8) fall back to `64`. |
 | `CLAUDE_STATUSLINE_BRANCH_MAXLEN` | integer ≥ 8 | `64`    | Hard ceiling on visible git branch length (chars). Invalid values fall back to `32`. |
+| `CLAUDE_STATUSLINE_TODO_MAXLEN` | integer ≥ 8 | `32`    | Hard ceiling on the todo-progress item text (chars, §10.1). Head-truncated with `…` (`_head_ellipsis`) when longer. Invalid values fall back to `32`. |
 
 ### 3.5 Extra-credits preview (Pro/Max)
 
@@ -188,6 +190,17 @@ All files live under `~/.claude/` by default. Set `CLAUDE_STATUSLINE_STATE_DIR` 
 **Write:** the background OAuth fetch creates this file when either (a) keychain returned an empty token, (b) `curl` exited non-zero or the response was not parseable JSON, or (c) the response was valid JSON but contained a top-level `"error"` key (e.g. a rate-limit or server error from the API). In case (c) the existing cache file is preserved rather than replaced.  
 **Clear:** removed by the next successful fetch (before the response is atomically moved into the usage cache).  
 **Effect on display:** while this file exists, the Pro/Max extra badge and the Enterprise monthly segment switch to the **auth-broken state** (🔑 glyph + strikethrough on the last-known amount); see §8.3 and §8.4.
+
+### 4.7 Task directory (read-only; not a statusline cache)
+**Path:** `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/tasks/<session_id>/` — Claude Code's own live task state, one JSON file per task (`<id>.json`), rewritten in place as tasks change. Deliberately **not** under `CLAUDE_STATUSLINE_STATE_DIR`/`$_CLAUDE_DIR` — that variable scopes only this script's own cache files; the task directory belongs to Claude Code.  
+**Schema (per file):**
+```json
+{ "id": "3", "subject": "Run initial converter build",
+  "description": "…", "activeForm": "Building @mui/material bundle",
+  "status": "in_progress", "blocks": [], "blockedBy": [] }
+```
+**Read:** only when `CLAUDE_STATUSLINE_TODOS != off` and `session_id` is non-empty, via a single `jq -s` pass over `<dir>/[0-9]*.json` (the glob excludes sibling `.lock`/`.highwatermark` files). This script never writes to this directory.  
+**Effect on display:** feeds the §10.1 todo-progress segment. A missing directory, no matching task files, or malformed JSON in any task file all result in the segment being hidden — never a partial render.
 
 ---
 
@@ -688,6 +701,7 @@ Segment order (each non-empty segment separated by two spaces `"  "`):
 1. Leading: `SPACE + "  "`
 2. Performance badge + `RESET` (if non-empty)
 3. `"  "` (always)
+3b. Todo/task progress segment (opt-in; §10.1) — if `CLAUDE_STATUSLINE_TODOS != off` and non-empty
 4. Slow-fetch `↻ ` (dim, one trailing space) — if fetch slow and any of 5/6/7 non-empty
 5. Plan display (Pro/Max) (if non-empty)
 6. Extra display (if non-empty)
@@ -695,15 +709,42 @@ Segment order (each non-empty segment separated by two spaces `"  "`):
 8. Cost pair + `"   "` (3 spaces, if non-empty)
 9. `DIM💸RESET + "  " + slot_15m + "  " + slot_1h + "  " + slot_1d` (if loadavg ≠ off; see adaptive truncation below)
 
-### Adaptive truncation of item 9
+### 10.1 Todo/task progress segment (opt-in, item 3b)
 
-After assembling items 1–8 into `$line2`, the rolling spend segment (item 9) is omitted if it would cause line 2 to wrap:
+Controlled by `CLAUDE_STATUSLINE_TODOS` (§3.1). Reads the task directory (§4.7).
 
-- Compute `_line2_available = raw_terminal_width − 3` (raw = before the 88-column floor applied to line 1)
-- Compute `_len_without = visible_length(line2) − 3` (subtract the 3-char leading overhead)
-- Compute `_len_spend = visible_length(spend_segment)`
-- If `_len_without ≤ _line2_available` AND `_len_without + _len_spend > _line2_available`, omit the spend segment silently (no ellipsis, no indicator)
-- If `CLAUDE_STATUSLINE_COST_LOADAVG=off`, item 9 is already skipped; no measurement is performed
+**Selecting the item:** one `jq -s` call over `<task_dir>/[0-9]*.json`:
+- `total` = number of task files; `completed` = count with `status == "completed"`
+- Current item = first task with `status == "in_progress"`, else the first `status == "pending"` task; item text = `.activeForm // .subject`
+- Segment hidden entirely when: the task directory is absent, no `[0-9]*.json` files match, any file fails to parse (never a partial render), `total == 0`, `completed == total` (all done), or `session_id` is empty
+
+**Rendering:**
+```
+☑ completed/total item_text
+```
+`☑` (U+2611) and the `completed/total` count render in the default foreground color; the item text renders `DIM`. The segment self-terminates with two trailing spaces, matching `monthly_seg`'s convention.
+
+- `CLAUDE_STATUSLINE_TODOS=on`: item text shown when line 2 has room (see adaptive truncation below), counts-only otherwise
+- `CLAUDE_STATUSLINE_TODOS=counts`: always counts-only (`☑ completed/total`), item text never shown
+- Item text longer than `CLAUDE_STATUSLINE_TODO_MAXLEN` (§3.4) is head-truncated with `…` via `_head_ellipsis` (tail-truncate — unlike the tail-weighted `_mid_ellipsis` used for paths, since for prose the head carries the meaning)
+
+### Adaptive truncation
+
+After assembling the always-shown segments (items 1–2, 4–8) into a base string, the todo segment and the rolling spend segment (item 9) are fit against the available width using a three-tier ladder, evaluated in this order and never degrading a tier further than needed to fit:
+
+1. **Todo item text + spend segment** — used when both fit
+2. **Todo counts-only + spend segment** — used when tier 1 doesn't fit but this does
+3. **Todo counts-only, spend segment dropped** — used when neither tier 1 nor 2 fits
+
+Definitions:
+- `_line2_available = raw_terminal_width − 3` (raw = before the 88-column floor applied to line 1)
+- `_len_base = visible_length(prefix + mid) − 3` (prefix = items 1–3; mid = items 4–8; subtract the 3-char leading overhead)
+- `_len_full`, `_len_short` = visible lengths of the todo segment's full-text and counts-only forms
+- `_len_spend` = visible length of the spend segment
+
+If `_len_base` alone already exceeds `_line2_available`, nothing can be trimmed to help, so the richest form (tier 1) is kept regardless — the same non-degradation guard applies within each tier: a segment is only dropped when doing so would actually bring the line under budget.
+
+When `CLAUDE_STATUSLINE_TODOS=off` (default) or the todo segment is empty, this reduces to the original single-segment check: the spend segment (item 9) is omitted if `_len_base ≤ _line2_available` AND `_len_base + _len_spend > _line2_available`. If `CLAUDE_STATUSLINE_COST_LOADAVG=off`, item 9 is already skipped; no measurement is performed.
 
 Terminal width detection (chain): `$COLUMNS` (set by Claude Code ≥ 2.1.153) → `/dev/tty` → stderr fd → ancestor PTY walk (fallback for older Claude Code) → fallback 220. The raw value is used for item 9's truncation check; the floored value (≥88) is used only for line 1 layout.
 
