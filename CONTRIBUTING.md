@@ -38,8 +38,13 @@ Before submitting a pull request, run:
 ```bash
 bash -n statusline-command.sh install.sh
 bats tests/
+scripts/benchmark.sh
 git diff --check
 ```
+
+The benchmark is advisory rather than timing-sensitive CI. Reference targets are
+75 ms for a minimal warm render, 120 ms for Enterprise, 250 ms for a cold
+5,000-row transcript, and 100 ms for unchanged or one-row-appended transcripts.
 
 Describe the user-visible outcome and any compatibility or security impact in
 the pull request. Keep each pull request focused enough to review and revert

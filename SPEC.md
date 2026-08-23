@@ -109,7 +109,7 @@ All files live under `~/.claude/` by default. Set `CLAUDE_STATUSLINE_STATE_DIR` 
 **Format:** one row per line: `<epoch_seconds> <session_id> <cost_usd> <workspace_hash>`  
 - `workspace_hash` = SHA-256 of `cwd` (fallback: `cksum` digest; fallback: `"empty"`).  
 **Purpose:** Time series for rolling 💸 spend windows (15m, 1h, 1d).  
-**Write:** appended unconditionally on every invocation with `NOW session_id cost workspace_hash`.  
+**Write:** append when the session, normalized cost, or CWD changes, or after a 300-second heartbeat. Repeated unchanged renders do not add duplicate rows. The workspace hash is computed only for a due sample and reused while CWD is unchanged.
 **Prune:** size-gated — run only when `file_size > LOG_PRUNE_SIZE_MAX` (≈256 KB). When triggered, keep:
 - All rows within the last 36 h.
 - One anchor per `session_id`: the single most-recent row older than 36 h for each unique `session_id`. Anchors let the window algorithm detect spend that started before the 36 h horizon without bloating the file.
@@ -124,15 +124,15 @@ All files live under `~/.claude/` by default. Set `CLAUDE_STATUSLINE_STATE_DIR` 
 **Path:** `~/.claude/statusline-session-baselines.tsv`  
 **Format:** TSV, 4 columns: `session_id  baseline_cost  first_seen_epoch  last_used_epoch`  
 **Purpose:** ∑ˢ (cost since last `/clear`) — baseline is the `cost` at first sight of a session_id. Also **consumed** by the 💸 1d rolling-window math as a lower bound on the daily reference (see §8.7).  
-**Write:** updated on every invocation (upsert by session_id, update `last_used_epoch`). Rewrites use the same per-process temp file + non-empty guard + atomic-rename pattern as the global log (see §4.1).  
-**GC:** ~1% of runs (`RANDOM % 100 == 0`) remove rows idle > 30 days.  
+**Write:** upsert immediately for a new session. For an existing session, reuse the instance-cached baseline and update `last_used_epoch` at most once per 24 hours. Rewrites use the same per-process temp file + non-empty guard + atomic-rename pattern as the global log (see §4.1).
+**GC:** rows idle > 30 days are removed during the new-session/daily maintenance pass.
 **Locking:** same lock as global usage log (written in same atomic block).
 
 ### 4.3 Instance carry cache
 **Path:** `~/.claude/statusline-instance-carry.<instance_key>.cache`  
-**Format:** 3 lines: `session_id`, `last_cost` (float), `carry` (float).  
+**Format:** 8 lines: `session_id`, `last_cost`, `carry`, `baseline_cost`, `baseline_touch_epoch`, `last_log_epoch`, `last_cwd`, `workspace_hash`. The first three lines are unchanged; old three-line files migrate lazily on their next render.
 **Purpose:** ∑ⁱ (total cost across all `/clear` resets in this process) — Claude Code resets `cost.total_cost_usd` to 0 at each `/clear` while generating a new `session_id`, so this file carries the pre-/clear accumulated cost forward.  
-**Write:** every invocation (overwrite, no lock — single-line write, last-writer-wins is acceptable).  
+**Write:** overwrite only when content changes (no lock; the file is scoped to one instance).
 **Detection:** session change (`session_id` differs from stored) OR cost decrease (`cost < last_cost - 0.001`) triggers accumulation: `carry += last_cost`. Otherwise `carry` is unchanged and `last_cost` is updated to current cost.  
 **Instance cost formula:** `instance_cost = carry + session_cost`.
 
@@ -140,7 +140,14 @@ All files live under `~/.claude/` by default. Set `CLAUDE_STATUSLINE_STATE_DIR` 
 - If `CLAUDE_STATUSLINE_INSTANCE_ID` is set, it is used verbatim as the key (advanced/testing override).
 - Otherwise, walk the `ppid` chain from `$$` (max 4 hops, same idiom as `_term_width_from_ancestor_pty()` in §11). At each hop, the ancestor's `comm` basename is checked; the first ancestor named `claude` supplies the key `<pid>-<lstart digits>` (the process start time, digits only, guards against a recycled pid reattaching to a dead instance's carry — the original bug).
 - **Fallbacks**, in order: if no ancestor named `claude` is found within 4 hops, the hop-1 parent's `<pid>-<lstart digits>` is used (covers wrapper-shell statusline configs); if `ps` yields nothing at all, the literal key `shared` is used.
-- **Stale-file reap:** on an instance's first render (i.e. when its keyed `CARRY_FILE` does not yet exist), two cleanup actions run once: `find ~/.claude -maxdepth 1 -name 'statusline-instance-carry.*.cache' -mtime +1 -delete` removes carry files from instances that exited more than a day ago, and the pre-fix single global file `~/.claude/statusline-instance-carry.cache` is removed if present (clears stale carry left over from before per-instance keying).
+- **Stale-file reap:** on an instance's first render, carry files idle for a day and transcript metric caches idle for seven days are removed; the pre-fix global carry file is also removed if present.
+
+### 4.3.1 Transcript metrics cache
+**Path:** `~/.claude/statusline-transcript-metrics.<path_hash>.cache`
+**Purpose:** cache token totals, sorted user→assistant latency state, and the raw-substring Ultracode state so unchanged renders avoid rescanning JSONL history.
+**Invalidation:** rebuild on schema mismatch, corruption, replacement, truncation, same-size rewrite with a changed mtime, newly enabled historical signal, or an appended timestamp preceding cached events. Complete append-only suffixes merge incrementally; an incomplete final JSONL record remains unprocessed until its newline arrives.
+**Concurrency:** updates use a per-transcript mkdir lock and atomic rename. After brief contention, the renderer performs a correct uncached scan instead of waiting.
+**GC:** caches unused for seven days are reaped on per-instance cold-start cleanup.
 
 ### 4.3 OAuth usage cache
 **Path:** `~/.claude/statusline-usage-cache.json`  
@@ -406,6 +413,7 @@ Line 2 **starts** with `SPACE` (U+200B) + `"  "` (two spaces).
 ### 8.1 Performance badge (optional)
 
 Shown when `CLAUDE_STATUSLINE_PERF_BADGE != "off"` and `transcript_path` is readable.
+Cache and latency are produced by the shared incremental processor in §4.3.1; Ultracode consumes the same scan. If both performance and Ultracode consumers are disabled, no transcript metadata or content is read.
 
 #### 8.1.1 Cache hit rate (skipped when mode = `latency_only`)
 From transcript JSONL, sum across all entries:
