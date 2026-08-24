@@ -1161,46 +1161,6 @@ else
 fi
 
 # ── Performance badge computation (§8.1, §3.1) ────────────────────────────────
-_perf_level_for_cache() {
-  awk -v r="$1" 'BEGIN {
-    if (r == "") { print -1; exit }
-    r += 0
-    if      (r >= 95) print 0
-    else if (r >= 90) print 1
-    else if (r >= 75) print 2
-    else              print 3
-  }'
-}
-
-_perf_level_for_latency() {
-  awk -v d="$1" 'BEGIN {
-    if (d == "") { print -1; exit }
-    d += 0
-    if      (d <= 10) print 0
-    else if (d <= 30) print 1
-    else if (d <= 60) print 2
-    else              print 3
-  }'
-}
-
-_perf_levels() {
-  awk -v r="$1" -v d="$2" 'BEGIN {
-    if (r == "") c=-1; else if (r+0 >= 95) c=0; else if (r+0 >= 90) c=1; else if (r+0 >= 75) c=2; else c=3
-    if (d == "") l=-1; else if (d+0 <= 10) l=0; else if (d+0 <= 30) l=1; else if (d+0 <= 60) l=2; else l=3
-    printf "%d\t%d\n", c, l
-  }'
-}
-
-_perf_levels_from_metrics() {
-  awk -v h="$1" -v t="$2" -v s="$3" -v n="$4" 'BEGIN {
-    if (t+0 <= 0) c=-1
-    else { r=h*100/t; c=(r>=95?0:r>=90?1:r>=75?2:3) }
-    if (n+0 <= 0) l=-1
-    else { d=s/n; l=(d<=10?0:d<=30?1:d<=60?2:3) }
-    printf "%d\t%d\n", c, l
-  }'
-}
-
 _decimal_millis() {
   local value=$1 whole=${1%%.*} frac
   frac=${value#*.}; [ "$frac" = "$value" ] && frac=""
@@ -1240,36 +1200,6 @@ if [ "$perf_mode" != "off" ]; then
       else latency_level=3
       fi
     fi
-  fi
-  if false; then
-    signals=$(jq -rs '
-      def usage: (.message.usage // .toolUseResult.usage // null);
-      def ts:
-        .timestamp as $t |
-        if   ($t | type) == "number" then (if $t > 1e12 then $t/1000 else $t end)
-        elif ($t | type) == "string" then ($t | fromdateiso8601? // null)
-        elif ($t | type) == "object" then ($t.epoch // $t.seconds // null)
-        else null end;
-      . as $rows
-      | ([$rows[] | usage | select(. != null)]) as $u
-      | ([$u[] | (.cache_read_input_tokens // 0)] | add // 0) as $hits
-      | ([$u[] | (.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)] | add // 0) as $total
-      | (if $total > 0 then ($hits * 100.0 / $total) else null end) as $hit_rate
-      | (reduce range(0; $rows|length) as $i ([];
-           ($rows[$i]) as $row |
-           if $row.type == "assistant" then
-             ([range(0; $i) | . as $j | $rows[$j] | select(.type == "user") | ts | select(. != null)]) as $uts
-             | ($row | ts) as $a_ts
-             | (if ($uts|length) > 0 then ($uts | last) else null end) as $u_ts
-             | if $u_ts != null and $a_ts != null and ($a_ts - $u_ts) > 0 and ($a_ts - $u_ts) < 86400
-               then . + [$a_ts - $u_ts]
-               else . end
-           else . end
-        )) as $deltas
-      | (if ($deltas|length) > 0 then ($deltas | add / length) else null end) as $avg_resp
-      | "\($hit_rate // "")\t\($avg_resp // "")"
-    ' "$transcript_path" 2>/dev/null)
-    : "${signals%%	*}" "${signals#*	}"
   fi
 
   case "$perf_mode" in
