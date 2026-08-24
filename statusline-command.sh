@@ -33,6 +33,12 @@ BASELINE_TTL=2592000      # 30 days in seconds
 BUDGET_WARN_LO=0.925      # green/yellow threshold (within 7.5%)
 BUDGET_WARN_HI=1.075      # yellow/red threshold (over 7.5%)
 LOG_PRUNE_SIZE_MAX=262144  # ~256 KB; prune only when file exceeds this (§4.1)
+COST_EQ_THRESHOLD=0.01    # ±$0.01 treated as equal (§8.6)
+# Scaled to the 6dp integer form _cost_same compares (matches cost_6f's %.6f formatting).
+# Uses awk, not bash's builtin printf, because bash's %f is locale-aware (e.g. pl_PL
+# renders "0,010000") while awk always emits "." — same reason cost_6f uses awk below.
+_cost_eq_threshold_6f=$(awk -v t="$COST_EQ_THRESHOLD" 'BEGIN{printf "%.6f", t}')
+COST_EQ_THRESHOLD_U=$((10#${_cost_eq_threshold_6f/./}))
 
 SPACE=$'\xe2\x80\x8b'   # U+200B zero-width space — leads line 2
 BRANCH_ICON='⎇'         # U+2387
@@ -120,7 +126,7 @@ IFS= read -r -d '' input || :
     (.session_id // ""),
     (.transcript_path // ""),
     (.version // "2.1.76")
-  ' <<< "$input" 2>/dev/null)
+  ' <<< "$input" 2>/dev/null | tr -d '\r')
 cost="${cost:-0}"
 # awk-normalized cost: always "." decimal, 6dp — safe for bash printf %.6f in any locale
 cost_6f=$(awk -v c="$cost" 'BEGIN{printf "%.6f", c+0}')
@@ -420,7 +426,7 @@ _fmt_cents() {
 _cost_same() {
   local a=${1/./} b=${2/./} d
   a=$((10#$a)); b=$((10#$b)); d=$(( a - b )); (( d < 0 )) && d=$(( -d ))
-  [ "$d" -le 10000 ]
+  [ "$d" -le "$COST_EQ_THRESHOLD_U" ]
 }
 
 # _mid_ellipsis(str, target_len) — middle-ellipsis, tail-weighted 40/60 split
