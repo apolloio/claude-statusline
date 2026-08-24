@@ -1847,7 +1847,11 @@ _spend_seg=""
 if [ "$loadavg_mode" != "off" ] && [ -f "$LOG_FILE" ]; then
   _spend_bfile="$BASELINE_FILE"; [ -f "$_spend_bfile" ] || _spend_bfile=/dev/null
   { IFS= read -r _spend_log_id; IFS= read -r _spend_base_id; } < <(_pair_identity "$LOG_FILE" "$_spend_bfile")
-  _spend_key="${_spend_log_id}|${_spend_base_id}|${session_id}|${cost_6f}|${_DAY_START}"
+  # Include a 60s time bucket so the cache self-invalidates on the clock even
+  # when the log/baseline files don't change (write-coalescing can otherwise
+  # leave them untouched for up to the 300s heartbeat, letting rolling-window
+  # totals lag wall-clock time by that much).
+  _spend_key="${_spend_log_id}|${_spend_base_id}|${session_id}|${cost_6f}|${_DAY_START}|$((NOW / 60))"
   _spend_hit=0
   if [ -f "$SPEND_METRICS_FILE" ]; then
     { IFS= read -r _spend_version; IFS= read -r _spend_cached_key; read -r s15 s1h s1d nd15 nd1h nd1d; IFS= read -r _spend_complete; } < "$SPEND_METRICS_FILE"

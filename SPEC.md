@@ -123,7 +123,7 @@ All files live under `~/.claude/` by default. Set `CLAUDE_STATUSLINE_STATE_DIR` 
 #### 4.1.1 Rolling-spend metrics cache
 **Path:** `~/.claude/statusline-spend-metrics.cache`
 **Purpose:** stores the six computed 15m/1h/1d spend and NODATA values so unchanged renders do not rescan the global usage log and session baselines.
-**Invalidation:** recompute when the high-resolution identity of either source file changes, or when the current session, normalized current cost, or local calendar day changes. The global usage log's 300-second heartbeat bounds time-only staleness when no other input changes. Corrupt or incompatible cache content is ignored and replaced atomically.
+**Invalidation:** recompute when the high-resolution identity of either source file changes, when the current session, normalized current cost, or local calendar day changes, or when the current 60-second wall-clock bucket (`epoch / 60`) advances. The 60-second bucket bounds time-only staleness to under a minute even when write-coalescing (§4.1 heartbeat) leaves the source files untouched. Corrupt or incompatible cache content is ignored and replaced atomically.
 
 ### 4.2 Session baselines
 **Path:** `~/.claude/statusline-session-baselines.tsv`  
