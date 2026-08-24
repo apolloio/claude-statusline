@@ -65,6 +65,30 @@ load test_helper
   assert_line2_contains "1d:\$1.00"
 }
 
+@test "render caches: rolling metrics invalidate when the wall-clock minute bucket advances" {
+  local payload cache
+  payload=$(make_json cwd=/tmp cost=1.00 session=bucket-session)
+  cache="$CLAUDE_STATUSLINE_STATE_DIR/statusline-spend-metrics.cache"
+
+  CLAUDE_STATUSLINE_COST_LOADAVG=spent_only run_statusline "$payload"
+  [ "$status" -eq 0 ]
+  [ -s "$cache" ]
+
+  # Rewrite the cached key with a minute bucket far in the past, leaving the
+  # log/baseline identity, session, cost, and day fields untouched. If the
+  # cache only keyed on those (pre-fix behavior), this would still hit.
+  local v1 k v3 v4 stale_key
+  { IFS= read -r v1; IFS= read -r k; IFS= read -r v3; IFS= read -r v4; } < "$cache"
+  stale_key="${k%|*}|0"
+  printf '%s\n%s\n%s\n%s\n' "$v1" "$stale_key" "$v3" "$v4" > "$cache"
+
+  CLAUDE_STATUSLINE_COST_LOADAVG=spent_only run_statusline "$payload"
+  [ "$status" -eq 0 ]
+  local new_key
+  new_key=$(sed -n '2p' "$cache")
+  [ "$new_key" != "$stale_key" ]
+}
+
 @test "render caches: incomplete cache files are rebuilt safely" {
   write_enterprise_cache 10000 100000
   local payload fields render spend
