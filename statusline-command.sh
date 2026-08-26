@@ -1276,11 +1276,11 @@ if [ -n "$_fh_util" ]; then
       _used_fmt=$(_fmt_cents "${_ex_used:-0}")
       _lim_fmt="\$$(_fmt_cents "${_ex_limit:-0}" 0)"
       if [ "$_auth_error" = "1" ]; then
-        extra_seg=" ${DIM}+🔑${RESET} ${STRIKETHROUGH}\$${_used_fmt}/${_lim_fmt}${RESET}"
+        extra_seg="  ${DIM}+🔑${RESET} ${STRIKETHROUGH}\$${_used_fmt}/${_lim_fmt}${RESET}"
       elif [ "$_usage_cache_stale" = "1" ]; then
-        extra_seg=" ${DIM}+⚠️${RESET} ${STRIKETHROUGH}\$${_used_fmt}${RESET}${DIM}/${_lim_fmt}${RESET}"
+        extra_seg="  ${DIM}+⚠️${RESET} ${STRIKETHROUGH}\$${_used_fmt}${RESET}${DIM}/${_lim_fmt}${RESET}"
       else
-        extra_seg=" ${DIM}+💰${RESET} ${BOLD}\$${_used_fmt}${RESET} ${DIM}/${_lim_fmt}${RESET}"
+        extra_seg="  ${DIM}+💰${RESET}${BOLD}\$${_used_fmt}${RESET}${DIM}/${_lim_fmt}${RESET}"
       fi
     fi
   fi
