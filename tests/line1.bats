@@ -65,6 +65,146 @@ load test_helper
   assert_line1_contains "⎇"
 }
 
+# ── Git status markers (CLAUDE_STATUSLINE_GIT_STATUS) ──────────────────────────
+
+@test "line1: git status markers absent by default (unset)" {
+  local repo="$BATS_TEST_TMPDIR/gs-default"
+  make_git_repo "$repo" main
+  echo dirty > "$repo/f"
+  run_statusline "$(make_json cwd="$repo")"
+  assert_line1_not_contains "!1"
+  assert_line1_not_contains "?1"
+}
+
+@test "line1: GIT_STATUS=dirty on a clean repo shows no markers" {
+  local repo="$BATS_TEST_TMPDIR/gs-clean"
+  make_git_repo "$repo" main
+  CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
+  assert_line1_not_contains "+"
+  assert_line1_not_contains "!"
+  assert_line1_not_contains "?1"
+}
+
+@test "line1: GIT_STATUS=dirty shows !1 for an unstaged modified tracked file" {
+  local repo="$BATS_TEST_TMPDIR/gs-dirty"
+  make_git_repo "$repo" main
+  echo x > "$repo/README"
+  git -C "$repo" add README
+  git -C "$repo" commit -qm "add README"
+  echo y >> "$repo/README"
+  CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
+  assert_line1_contains "!1"
+  assert_line1_not_contains "+"
+  assert_line1_not_contains "?1"
+}
+
+@test "line1: GIT_STATUS=dirty shows +1 for a staged new file" {
+  local repo="$BATS_TEST_TMPDIR/gs-staged"
+  make_git_repo "$repo" main
+  echo x > "$repo/added.txt"
+  git -C "$repo" add added.txt
+  CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
+  assert_line1_contains "+1"
+  assert_line1_not_contains "!"
+  assert_line1_not_contains "?1"
+}
+
+@test "line1: GIT_STATUS=dirty shows ?1 for an untracked file only" {
+  local repo="$BATS_TEST_TMPDIR/gs-untracked"
+  make_git_repo "$repo" main
+  echo new > "$repo/new.txt"
+  CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
+  assert_line1_contains "?1"
+  assert_line1_not_contains "+"
+  assert_line1_not_contains "!"
+}
+
+@test "line1: GIT_UNTRACKED=off hides ?N even with an untracked file" {
+  local repo="$BATS_TEST_TMPDIR/gs-untracked-off"
+  make_git_repo "$repo" main
+  echo new > "$repo/new.txt"
+  CLAUDE_STATUSLINE_GIT_STATUS=dirty CLAUDE_STATUSLINE_GIT_UNTRACKED=off \
+    run_statusline "$(make_json cwd="$repo")"
+  assert_line1_not_contains "?1"
+  assert_line1_not_contains "+"
+  assert_line1_not_contains "!"
+}
+
+@test "line1: GIT_STATUS=on shows ahead/behind counts against upstream" {
+  local remote="$BATS_TEST_TMPDIR/gs-remote" repo="$BATS_TEST_TMPDIR/gs-clone"
+  make_git_repo "$remote" main
+  git clone -q "$remote" "$repo" 2>/dev/null
+  git -C "$repo" config user.email "test@example.com"
+  git -C "$repo" config user.name "Test"
+  # One commit only on the remote (behind), one commit only local (ahead).
+  git -C "$remote" commit --allow-empty -qm "remote-only"
+  git -C "$repo" fetch -q
+  git -C "$repo" commit --allow-empty -qm "local-only"
+  CLAUDE_STATUSLINE_GIT_STATUS=on run_statusline "$(make_json cwd="$repo")"
+  assert_line1_contains "↑1"
+  assert_line1_contains "↓1"
+}
+
+@test "line1: GIT_STATUS=on with no upstream shows no arrows" {
+  local repo="$BATS_TEST_TMPDIR/gs-no-upstream"
+  make_git_repo "$repo" main
+  CLAUDE_STATUSLINE_GIT_STATUS=on run_statusline "$(make_json cwd="$repo")"
+  assert_line1_not_contains "↑"
+  assert_line1_not_contains "↓"
+}
+
+@test "line1: GIT_STATUS=dirty never shows arrows even when ahead" {
+  local remote="$BATS_TEST_TMPDIR/gs-remote2" repo="$BATS_TEST_TMPDIR/gs-clone2"
+  make_git_repo "$remote" main
+  git clone -q "$remote" "$repo" 2>/dev/null
+  git -C "$repo" config user.email "test@example.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" commit --allow-empty -qm "local-only"
+  CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
+  assert_line1_not_contains "↑"
+  assert_line1_not_contains "↓"
+}
+
+@test "line1: GIT_STATUS=dirty on detached HEAD shows hash plus !1 with no arrows" {
+  local repo="$BATS_TEST_TMPDIR/gs-detached"
+  make_git_repo "$repo" main
+  echo x > "$repo/README"
+  git -C "$repo" add README
+  git -C "$repo" commit -qm "add README"
+  git -C "$repo" checkout --detach HEAD --quiet 2>/dev/null
+  echo y >> "$repo/README"
+  CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
+  assert_line1_contains "⎇"
+  assert_line1_contains "!1"
+  assert_line1_not_contains "↑"
+  assert_line1_not_contains "↓"
+}
+
+@test "line1: CWD budget shrinks by the marker suffix width when markers are shown" {
+  # Deeply nested CWD forces CWD to be the truncated segment, so any budget
+  # miscalculation from the marker suffix shows up as a CWD length delta.
+  local deep="$BATS_TEST_TMPDIR/aa/bb/cc/dd/ee/ff/gg/hh/ii/jj/kk/ll/mm/nn/oo/pp/project"
+  local repo="$deep"
+  make_git_repo "$repo" main
+  echo x > "$repo/README"
+  git -C "$repo" add README
+  git -C "$repo" commit -qm "add README"
+  echo y >> "$repo/README"
+
+  COLUMNS=80 run_statusline "$(make_json cwd="$repo")"
+  [ "$status" -eq 0 ]
+  local off_line; off_line="$(line1)"
+
+  COLUMNS=80 CLAUDE_STATUSLINE_GIT_STATUS=dirty run_statusline "$(make_json cwd="$repo")"
+  [ "$status" -eq 0 ]
+  local dirty_line; dirty_line="$(line1)"
+
+  # Marker adds exactly three visible characters (" !1" incl. leading space),
+  # and the CWD budget subtracts that width, so total line length should grow
+  # by exactly 3.
+  [ "$(( ${#dirty_line} - ${#off_line} )) " = "3 " ]
+}
+
 # ── Model name ────────────────────────────────────────────────────────────────
 
 @test "line1: shows model display name" {

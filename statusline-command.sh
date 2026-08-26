@@ -22,6 +22,10 @@ DOT_RED=$'\033[38;5;196m'
 # Rainbow gradient for the ultracode effort badge — one 256-color step per letter.
 UC_RAINBOW=$'\033[38;5;196mu\033[38;5;208ml\033[38;5;220mt\033[38;5;190mr\033[38;5;82ma\033[38;5;51mc\033[38;5;33mo\033[38;5;99md\033[38;5;201me\033[0m'
 DOT_GREY=$'\033[38;5;245m'
+DIM_GREEN=$'\033[2;32m'          # ↑N ahead-of-upstream marker (§7.3.1)
+DIM_ORANGE=$'\033[2;38;5;208m'   # ↓N behind-upstream marker (§7.3.1)
+GIT_STAGED_COLOR="$GREEN"        # +N staged marker (§7.3.1)
+GIT_UNTRACKED_COLOR="$DIM"       # ?N untracked marker (§7.3.1)
 
 # ── Named thresholds ───────────────────────────────────────────────────────────
 COST_EQ_THRESHOLD=0.01    # ±$0.01 treated as equal (§8.6)
@@ -417,6 +421,8 @@ loadavg_mode=$(_env_opt CLAUDE_STATUSLINE_COST_LOADAVG on on spent_only off)
 ultracode_mode=$(_env_opt CLAUDE_STATUSLINE_ULTRACODE on on off)
 sign_mode=$(_env_opt CLAUDE_STATUSLINE_BUDGET_SIGN_MODE neutral neutral used_minus remaining_plus both)
 show_pace_ratio=$(_env_opt CLAUDE_STATUSLINE_SHOW_PACE_RATIO on on off)
+git_status_mode=$(_env_opt CLAUDE_STATUSLINE_GIT_STATUS off off dirty on)
+git_untracked_mode=$(_env_opt CLAUDE_STATUSLINE_GIT_UNTRACKED on on off)
 
 hours_per_day="${CLAUDE_STATUSLINE_BUDGET_HOURS_PER_DAY:-6}"
 awk -v h="$hours_per_day" 'BEGIN { exit (h+0 > 0 ? 0 : 1) }' </dev/null 2>/dev/null || hours_per_day=6
@@ -685,9 +691,68 @@ if [ -n "$cwd" ] && git -C "$cwd" --no-optional-locks rev-parse --git-dir >/dev/
   [ -n "$_branch_raw" ] && _branch_disp=$(_shorten_path "$_branch_raw" "$_branch_budget")
 fi
 
-# CWD budget: subtract actual branch display length (not its ceiling) + 3 for " ⎇ " separator
+# §7.3.1 Git status markers (opt-in via CLAUDE_STATUSLINE_GIT_STATUS, off by default —
+# adds a `git status` + awk fork only when enabled).
+_git_status_suffix=""
+_git_status_suffix_width=0
+if [ -n "$_branch_disp" ] && [ "$git_status_mode" != "off" ]; then
+  _ut_flag="--untracked-files=normal"
+  [ "$git_untracked_mode" = "off" ] && _ut_flag="--untracked-files=no"
+  _gs_out=$(git -C "$cwd" --no-optional-locks status --porcelain=v1 --branch $_ut_flag 2>/dev/null)
+  if [ -n "$_gs_out" ]; then
+    { IFS= read -r _gs_staged; IFS= read -r _gs_unstaged; IFS= read -r _gs_untracked; IFS= read -r _gs_ahead; IFS= read -r _gs_behind; } < <(
+      awk '
+        /^## / {
+          if (match($0, /ahead [0-9]+/))  { a = substr($0, RSTART + 6, RLENGTH - 6) }
+          if (match($0, /behind [0-9]+/)) { b = substr($0, RSTART + 7, RLENGTH - 7) }
+          next
+        }
+        /^\?\? / { u++; next }
+        { if (substr($0, 1, 1) != " ") s++; if (substr($0, 2, 1) != " ") m++ }
+        END { print s+0; print m+0; print u+0; print a+0; print b+0 }
+      ' <<< "$_gs_out"
+    )
+    _dirty_mark=""
+    if [ "${_gs_staged:-0}" -gt 0 ]; then
+      _dirty_mark+="${GIT_STAGED_COLOR}+${_gs_staged}${RESET}"
+      _git_status_suffix_width=$(( _git_status_suffix_width + 1 + ${#_gs_staged} ))
+    fi
+    if [ "${_gs_unstaged:-0}" -gt 0 ]; then
+      [ -n "$_dirty_mark" ] && { _dirty_mark+=" "; _git_status_suffix_width=$(( _git_status_suffix_width + 1 )); }
+      _dirty_mark+="${YELLOW}!${_gs_unstaged}${RESET}"
+      _git_status_suffix_width=$(( _git_status_suffix_width + 1 + ${#_gs_unstaged} ))
+    fi
+    if [ "$git_untracked_mode" != "off" ] && [ "${_gs_untracked:-0}" -gt 0 ]; then
+      [ -n "$_dirty_mark" ] && { _dirty_mark+=" "; _git_status_suffix_width=$(( _git_status_suffix_width + 1 )); }
+      _dirty_mark+="${GIT_UNTRACKED_COLOR}?${_gs_untracked}${RESET}"
+      _git_status_suffix_width=$(( _git_status_suffix_width + 1 + ${#_gs_untracked} ))
+    fi
+    if [ -n "$_dirty_mark" ]; then
+      _git_status_suffix+=" ${_dirty_mark}"
+      _git_status_suffix_width=$(( _git_status_suffix_width + 1 ))
+    fi
+    if [ "$git_status_mode" = "on" ]; then
+      _git_arrows=""
+      if [ "${_gs_ahead:-0}" -gt 0 ]; then
+        _git_arrows+="${DIM_GREEN}↑${_gs_ahead}${RESET}"
+        _git_status_suffix_width=$(( _git_status_suffix_width + 1 + ${#_gs_ahead} ))
+      fi
+      if [ "${_gs_behind:-0}" -gt 0 ]; then
+        _git_arrows+="${DIM_ORANGE}↓${_gs_behind}${RESET}"
+        _git_status_suffix_width=$(( _git_status_suffix_width + 1 + ${#_gs_behind} ))
+      fi
+      if [ -n "$_git_arrows" ]; then
+        _git_status_suffix+=" ${_git_arrows}"
+        _git_status_suffix_width=$(( _git_status_suffix_width + 1 ))
+      fi
+    fi
+  fi
+fi
+
+# CWD budget: subtract actual branch display length (not its ceiling) + 3 for " ⎇ " separator,
+# plus the visible width of any git status marker suffix.
 if [ -n "$_branch_disp" ]; then
-  _cwd_budget=$(( _combined_budget - ${#_branch_disp} - 3 ))
+  _cwd_budget=$(( _combined_budget - ${#_branch_disp} - 3 - _git_status_suffix_width ))
 else
   _cwd_budget=$_combined_budget
 fi
@@ -706,7 +771,7 @@ fi
 
 # §7.3 Git branch segment (green, optional)
 if [ -n "$_branch_disp" ]; then
-  line1+=" ${GREEN}${BRANCH_ICON} ${_branch_disp}${RESET}"
+  line1+=" ${GREEN}${BRANCH_ICON} ${_branch_disp}${RESET}${_git_status_suffix}"
 fi
 
 # §7.4 Thinking indicator
