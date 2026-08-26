@@ -18,6 +18,9 @@ DOT_GREEN=$'\033[38;5;82m'
 DOT_YELLOW=$'\033[38;5;220m'
 DOT_ORANGE=$'\033[38;5;208m'
 DOT_RED=$'\033[38;5;196m'
+
+# Rainbow gradient for the ultracode effort badge — one 256-color step per letter.
+UC_RAINBOW=$'\033[38;5;196mu\033[38;5;208ml\033[38;5;220mt\033[38;5;190mr\033[38;5;82ma\033[38;5;51mc\033[38;5;33mo\033[38;5;99md\033[38;5;201me\033[0m'
 DOT_GREY=$'\033[38;5;245m'
 
 # ── Named thresholds ───────────────────────────────────────────────────────────
@@ -411,6 +414,7 @@ instance_cost=$(awk -v carry="$instance_carry" -v sess="$session_cost" \
 
 cost_mode=$(_env_opt CLAUDE_STATUSLINE_COST_CURRENT on on session instance off)
 loadavg_mode=$(_env_opt CLAUDE_STATUSLINE_COST_LOADAVG on on spent_only off)
+ultracode_mode=$(_env_opt CLAUDE_STATUSLINE_ULTRACODE on on off)
 sign_mode=$(_env_opt CLAUDE_STATUSLINE_BUDGET_SIGN_MODE neutral neutral used_minus remaining_plus both)
 show_pace_ratio=$(_env_opt CLAUDE_STATUSLINE_SHOW_PACE_RATIO on on off)
 
@@ -631,10 +635,35 @@ fi
 _TERM_W_RAW=$_TERM_W   # save pre-floor value for line 2 adaptive truncation
 (( _TERM_W < _TERM_W_MIN )) && _TERM_W=$_TERM_W_MIN
 
+# Ultracode detection. `/effort ultracode` never reaches us as its own value: Claude Code
+# normalizes it internally ({ultracode:"xhigh"}), so effort.level arrives as plain "xhigh".
+# The only observable signal is the ultra_effort_enter / ultra_effort_exit attachment pair
+# in the transcript — an enter/exit state machine where the last event wins.
+# Ultracode implies xhigh, so a non-xhigh level rules it out — that guard both kills false
+# positives (attachments lag a prompt behind a level change) and skips the scan entirely for
+# every other effort level.
+# ponytail: raw substring match, not a JSON parse — awk over the file is far cheaper than jq
+# and this runs on every render. Two known ceilings: (1) a message quoting the literal
+# attachment-type text is a false positive, (2) attachments are only written when the next
+# user prompt is built, so a fresh toggle shows up one prompt late. Switch to a jq pass on
+# .attachment.type if either bites.
+_ultracode=0
+if [ "$ultracode_mode" != "off" ] && [ "$effort_level" = "xhigh" ] && \
+   [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -r "$transcript_path" ]; then
+  _ultracode=$(awk '
+    /"type":"ultra_effort_enter"/ { s = 1 }
+    /"type":"ultra_effort_exit"/  { s = 0 }
+    END { print s + 0 }
+  ' "$transcript_path" 2>/dev/null)
+  [ "$_ultracode" = "1" ] || _ultracode=0
+fi
+
 # Estimate chars consumed by fixed elements (model, effort, fast, thinking, ctx, leading space).
 # Branch separator " ⎇ " (3 chars) is excluded here — it's subtracted separately in the cwd budget.
 _thinking_chars=0; [ "$thinking_enabled" = "true" ] && _thinking_chars=3
 _effort_chars=0;   [ -n "$effort_level" ] && _effort_chars=2
+# Ultracode renders as the rainbow word "ultracode" rather than a single glyph.
+[ "$_ultracode" = "1" ] && _effort_chars=10
 _fast_chars=0;     [ "$fast_mode" = "true" ] && _fast_chars=2
 _model_chars=0;    [ -n "$model_name" ] && _model_chars=$(( 1 + ${#model_name} ))
 # 1=leading space, 20=ctx segment worst-case " ctx:200k/200k≈100%"
@@ -695,7 +724,9 @@ if [ "$fast_mode" = "true" ]; then
   line1+=" ${ORANGE}↯${RESET}"
 fi
 
-if [ -n "$effort_level" ]; then
+if [ "$_ultracode" = "1" ]; then
+  line1+=" ${UC_RAINBOW}"
+elif [ -n "$effort_level" ]; then
   case "$effort_level" in
     none)  line1+=" ${DIM}∅${RESET}" ;;
     low)   line1+=" ${GREEN}○${RESET}" ;;

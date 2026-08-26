@@ -112,6 +112,8 @@ Or add it manually to `~/.claude/settings.json` as mentioned above.
 
 Leaving effort on max all the time can easily double or triple your monthly bill without proportional value.
 
+**Ultracode** — when `/effort ultracode` is active, the usual `xhigh` glyph is replaced with a rainbow `ultracode` badge. Claude Code reports Ultracode as plain `xhigh` to statusline commands, so the script detects it from the session transcript. After changing effort, the badge can lag by one prompt; it only appears while the reported effort level remains `xhigh`. Set `CLAUDE_STATUSLINE_ULTRACODE=off` to disable the transcript scan and keep the standard `◉` glyph.
+
 **Context usage** (`ctx:80k/200k [61%]`) — how much of the session context is used. Color signals:
 
 - **Blue** — token count is high (>150k by default), even if % looks fine. LLM attention is still limited regardless of window size.
@@ -185,6 +187,7 @@ Example configuration:
 | `CLAUDE_STATUSLINE_COST_CURRENT` | `on` \| `session` \| `instance` \| `off` | `on` | Which cost badges appear. `on`: show ∑ˢ always, ∑ⁱ only when it differs. `session`/`instance`: show one only. `off`: hide both. |
 | `CLAUDE_STATUSLINE_COST_LOADAVG` | `on` \| `spent_only` \| `off` | `on` | Rolling 💸 windows. `on` includes allowance suffix; `spent_only` shows spend only; `off` hides the segment entirely. |
 | `CLAUDE_STATUSLINE_PERF_BADGE` | `on` \| `cache_only` \| `latency_only` \| `off` | `on` | Cache/latency dot cluster. |
+| `CLAUDE_STATUSLINE_ULTRACODE` | `on` \| `off` | `on` | Detect `/effort ultracode` from the session transcript and show the rainbow `ultracode` badge in place of the `xhigh` glyph. |
 | `CLAUDE_STATUSLINE_SHOW_PACE_RATIO` | `on` \| `off` | `on` | Show 🔥pace× in the monthly segment. |
 
 ### Line 1 display lengths
