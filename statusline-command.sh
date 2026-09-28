@@ -1026,11 +1026,12 @@ _budget_color() {
 _iso_reset_hhmm() {
   local dt="$1"
   [ -z "$dt" ] && return
-  # Strip fractional seconds and Z/offset, parse to epoch, format local HH:MM
-  local epoch
-  epoch=$(printf '%s' "$dt" | sed 's/\.[0-9]*//g; s/Z$//' | \
-    (date -jf "%Y-%m-%dT%H:%M:%S" "$(cat)" +%s 2>/dev/null || \
-     date -d "$(cat | sed 's/T/ /')" +%s 2>/dev/null)) 2>/dev/null
+  # BSD date needs the fraction removed and the offset in +HHMM form.
+  # Keep the offset: parsing a UTC clock as local shifts the reset time.
+  local normalized epoch
+  normalized=$(printf '%s' "$dt" | sed -E 's/\.[0-9]+//; s/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/')
+  epoch=$(date -juf "%Y-%m-%dT%H:%M:%S%z" "$normalized" +%s 2>/dev/null) || \
+    epoch=$(date -d "$dt" +%s 2>/dev/null)
   [ -n "$epoch" ] && (date -d "@$epoch" +%H:%M 2>/dev/null || date -r "$epoch" +%H:%M 2>/dev/null)
 }
 
