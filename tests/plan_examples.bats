@@ -59,6 +59,20 @@ load test_helper
   assert_line2_contains "↻"
 }
 
+@test "5h UTC reset time converts to Warsaw summer time" {
+  export TZ=Europe/Warsaw
+  write_pro_cache 100 7 0 100 "2026-09-28T09:40:00.123456+00:00"
+  run_statusline "$(make_json cwd=/tmp cost=0.95 session=s1)"
+  assert_line2_contains "5h:🪫100% ↻11:40"
+}
+
+@test "5h Z reset time converts to Warsaw winter time" {
+  export TZ=Europe/Warsaw
+  write_pro_cache 82 7 0 100 "2026-12-28T09:40:00.123456Z"
+  run_statusline "$(make_json cwd=/tmp cost=0.95 session=s1)"
+  assert_line2_contains "5h:82% ↻10:40"
+}
+
 @test "example B: extra preview → \$0.00 used shown in badge" {
   write_pro_cache 82 7 0 100
   run_statusline "$(make_json cwd=/tmp cost=0.95 session=s1)"
