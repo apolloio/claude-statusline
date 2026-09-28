@@ -68,6 +68,56 @@ EOF
   grep -q 'my-unique-session' "$LOG_FILE"
 }
 
+@test "state: unchanged renders do not append duplicate usage rows" {
+  export CLAUDE_STATUSLINE_INSTANCE_ID=coalesce-test
+  run_statusline "$(make_json session=stable cost=1.00 cwd=/tmp)"
+  run_statusline "$(make_json session=stable cost=1.00 cwd=/tmp)"
+  [ "$(wc -l < "$LOG_FILE" | tr -d ' ')" -eq 1 ]
+}
+
+@test "state: session, cost, and cwd changes each append a usage row" {
+  export CLAUDE_STATUSLINE_INSTANCE_ID=change-test
+  run_statusline "$(make_json session=a cost=1.00 cwd=/tmp)"
+  run_statusline "$(make_json session=a cost=1.01 cwd=/tmp)"
+  run_statusline "$(make_json session=a cost=1.01 cwd=/var)"
+  run_statusline "$(make_json session=b cost=1.01 cwd=/var)"
+  [ "$(wc -l < "$LOG_FILE" | tr -d ' ')" -eq 4 ]
+}
+
+@test "state: five-minute heartbeat appends an otherwise unchanged sample" {
+  export CLAUDE_STATUSLINE_INSTANCE_ID=heartbeat-test
+  local carry="$CLAUDE_STATUSLINE_STATE_DIR/statusline-instance-carry.heartbeat-test.cache"
+  run_statusline "$(make_json session=stable cost=1.00 cwd=/tmp)"
+  local old=$(( $(date +%s) - 301 )) tmp="$carry.tmp"
+  awk -v old="$old" 'NR==6{$0=old}{print}' "$carry" > "$tmp" && mv "$tmp" "$carry"
+  run_statusline "$(make_json session=stable cost=1.00 cwd=/tmp)"
+  [ "$(wc -l < "$LOG_FILE" | tr -d ' ')" -eq 2 ]
+}
+
+@test "state: carry cache lazily migrates from three to eight lines" {
+  export CLAUDE_STATUSLINE_INSTANCE_ID=migrate-test
+  local carry="$CLAUDE_STATUSLINE_STATE_DIR/statusline-instance-carry.migrate-test.cache"
+  printf 'legacy\n1.000000\n0\n' > "$carry"
+  run_statusline "$(make_json session=legacy cost=1.00 cwd=/tmp)"
+  [ "$(wc -l < "$carry" | tr -d ' ')" -eq 8 ]
+  [ "$(sed -n '1p' "$carry")" = legacy ]
+}
+
+@test "state: baseline last_used is touched at most daily" {
+  export CLAUDE_STATUSLINE_INSTANCE_ID=touch-test
+  local carry="$CLAUDE_STATUSLINE_STATE_DIR/statusline-instance-carry.touch-test.cache"
+  run_statusline "$(make_json session=touch cost=1.00 cwd=/tmp)"
+  local first second old tmp="$carry.tmp"
+  first=$(awk -F'\t' '$1=="touch"{print $4}' "$SESSION_BASELINE_FILE")
+  run_statusline "$(make_json session=touch cost=1.00 cwd=/tmp)"
+  second=$(awk -F'\t' '$1=="touch"{print $4}' "$SESSION_BASELINE_FILE")
+  [ "$first" = "$second" ]
+  old=$(( $(date +%s) - 86401 ))
+  awk -v old="$old" 'NR==5{$0=old}{print}' "$carry" > "$tmp" && mv "$tmp" "$carry"
+  run_statusline "$(make_json session=touch cost=1.00 cwd=/tmp)"
+  [ "$(sed -n '5p' "$carry")" -gt "$old" ]
+}
+
 # ── Session baseline file ──────────────────────────────────────────────────────
 
 @test "state: session baseline file created on first run" {

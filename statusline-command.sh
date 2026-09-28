@@ -28,19 +28,31 @@ GIT_STAGED_COLOR="$GREEN"        # +N staged marker (§7.3.1)
 GIT_UNTRACKED_COLOR="$DIM"       # ?N untracked marker (§7.3.1)
 
 # ── Named thresholds ───────────────────────────────────────────────────────────
-COST_EQ_THRESHOLD=0.01    # ±$0.01 treated as equal (§8.6)
 LOG_PRUNE_WINDOW=129600   # 36 hours in seconds
 BASELINE_TTL=2592000      # 30 days in seconds
 BUDGET_WARN_LO=0.925      # green/yellow threshold (within 7.5%)
 BUDGET_WARN_HI=1.075      # yellow/red threshold (over 7.5%)
 LOG_PRUNE_SIZE_MAX=262144  # ~256 KB; prune only when file exceeds this (§4.1)
+COST_EQ_THRESHOLD=0.01    # ±$0.01 treated as equal (§8.6)
+# Scaled to the 6dp integer form _cost_same compares (matches cost_6f's %.6f formatting).
+# Uses awk, not bash's builtin printf, because bash's %f is locale-aware (e.g. pl_PL
+# renders "0,010000") while awk always emits "." — same reason cost_6f uses awk below.
+_cost_eq_threshold_6f=$(awk -v t="$COST_EQ_THRESHOLD" 'BEGIN{printf "%.6f", t}')
+COST_EQ_THRESHOLD_U=$((10#${_cost_eq_threshold_6f/./}))
 
 SPACE=$'\xe2\x80\x8b'   # U+200B zero-width space — leads line 2
 BRANCH_ICON='⎇'         # U+2387
 
-# Detect user's decimal separator once; used by _fmt_money for locale-consistent output.
-DECIMAL_POINT=$(locale -k LC_NUMERIC 2>/dev/null \
-                | awk -F'"' '/^decimal_point=/{print $2; exit}')
+# Detect the user's decimal separator with one locale process.
+DECIMAL_POINT=.
+while IFS= read -r _locale_line; do
+  case "$_locale_line" in
+    decimal_point=*)
+      DECIMAL_POINT=${_locale_line#*=}
+      DECIMAL_POINT=${DECIMAL_POINT#\"}; DECIMAL_POINT=${DECIMAL_POINT%\"}
+      break ;;
+  esac
+done < <(locale -k LC_NUMERIC 2>/dev/null)
 : "${DECIMAL_POINT:=.}"
 
 # ── State file paths (§4) ──────────────────────────────────────────────────────
@@ -54,33 +66,40 @@ BASELINE_FILE="$_CLAUDE_DIR/statusline-session-baselines.tsv"
 # time guards against a recycled pid reattaching to a dead instance's file.
 _instance_key() {
   if [ -n "$CLAUDE_STATUSLINE_INSTANCE_ID" ]; then
-    printf '%s' "$CLAUDE_STATUSLINE_INSTANCE_ID"
+    _INSTANCE_KEY_RESULT="$CLAUDE_STATUSLINE_INSTANCE_ID"
     return
   fi
-  local pid=$$ hop l1 l2 l3 l4 l5 comm key fallback=""
+  local pid=$PPID ppid hop l1 l2 l3 l4 l5 comm key fallback="" stamp ch digits i
   for hop in 1 2 3 4; do
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    read -r ppid l1 l2 l3 l4 l5 comm < <(ps -o ppid=,lstart=,comm= -p "$pid" 2>/dev/null)
     [ -z "$pid" ] || [ "$pid" = "0" ] && break
-    read -r l1 l2 l3 l4 l5 comm < <(ps -o lstart=,comm= -p "$pid" 2>/dev/null)
-    key="${pid}-$(printf '%s' "$l1$l2$l3$l4$l5" | tr -cd '0-9')"
+    stamp="$l1$l2$l3$l4$l5"; digits=""
+    for ((i=0; i<${#stamp}; i++)); do ch=${stamp:i:1}; case "$ch" in [0-9]) digits+="$ch" ;; esac; done
+    key="${pid}-${digits}"
     [ "$hop" = "1" ] && fallback="$key"
-    [ "${comm##*/}" = "claude" ] && { printf '%s' "$key"; return; }
+    [ "${comm##*/}" = "claude" ] && { _INSTANCE_KEY_RESULT="$key"; return; }
+    pid=$ppid
   done
-  printf '%s' "${fallback:-shared}"
+  _INSTANCE_KEY_RESULT="${fallback:-shared}"
 }
-CARRY_FILE="$_CLAUDE_DIR/statusline-instance-carry.$(_instance_key).cache"
+_instance_key
+CARRY_FILE="$_CLAUDE_DIR/statusline-instance-carry.${_INSTANCE_KEY_RESULT}.cache"
 LOCK_DIR="$_CLAUDE_DIR/statusline-log.lock"
 USAGE_CACHE_FILE="$_CLAUDE_DIR/statusline-usage-cache.json"
+USAGE_FIELDS_FILE="$_CLAUDE_DIR/statusline-usage-fields.cache"
+USAGE_RENDER_FILE="$_CLAUDE_DIR/statusline-usage-render.cache"
 USAGE_FETCH_LOCK="$_CLAUDE_DIR/statusline-usage-fetch.lock"
 RUNWAY_CACHE_FILE="$_CLAUDE_DIR/statusline-runway-allowances.cache"
+SPEND_METRICS_FILE="$_CLAUDE_DIR/statusline-spend-metrics.cache"
 AUTH_ERROR_FILE="$_CLAUDE_DIR/statusline-usage-fetch.error"
 CACHE_TTL=300
 LOCK_INFLIGHT_GRACE=60    # lock_age < this → fetch in flight → suppress ⚠️
 FETCH_RETRY_COOLDOWN=120  # don't spawn a new fetch more often than this
 LOCK_LEAK_TIMEOUT=600     # lock_age >= this → abandoned (sleep/reboot) → suppress ⚠️
 
-# ── Read stdin ─────────────────────────────────────────────────────────────────
-input=$(cat)
+# ── Read stdin with a Bash builtin ────────────────────────────────────────────
+input=""
+IFS= read -r -d '' input || :
 
 # ── Field extraction (§2) — single jq pass, one field per line (bash 3.2 safe) ─
 {
@@ -133,19 +152,224 @@ workspace_hash() {
   printf '%s' "$h"
 }
 
+# Stable, dependency-free hash for internal transcript cache filenames.
+_path_hash() {
+  local value=$1 hash=5381 i ch code
+  for ((i=0; i<${#value}; i++)); do
+    ch=${value:i:1}; printf -v code '%d' "'$ch"
+    hash=$(( hash * 33 + code ))
+  done
+  if (( hash < 0 )); then _PATH_HASH_RESULT="n$(( -hash ))"; else _PATH_HASH_RESULT="p${hash}"; fi
+}
+
 # _mtime(path) — file mtime epoch (GNU stat first: -f on Linux means filesystem stat and exits 0
 # with garbage output, so GNU -c %Y must come before BSD -f %m)
-_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+_mtime() {
+  if [[ "$OSTYPE" == darwin* || "$OSTYPE" == *bsd* ]]; then stat -f %m "$1" 2>/dev/null || echo 0
+  else stat -c %Y "$1" 2>/dev/null || echo 0
+  fi
+}
 
 # _fsize(path) — file size in bytes (GNU -c %s first, BSD -f %z fallback)
-_fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0; }
+_fsize() {
+  if [[ "$OSTYPE" == darwin* || "$OSTYPE" == *bsd* ]]; then stat -f %z "$1" 2>/dev/null || echo 0
+  else stat -c %s "$1" 2>/dev/null || echo 0
+  fi
+}
+
+# _file_identity path → inode|high-resolution-mtime|size|epoch-mtime. Keep
+# this together so cache keys need only one metadata snapshot and one stat.
+_file_identity() {
+  if [[ "$OSTYPE" == darwin* || "$OSTYPE" == *bsd* ]]; then
+    stat -f '%i|%Fm|%z|%m' "$1" 2>/dev/null || printf '0|0|0|0\n'
+  else
+    stat -c '%i|%y|%s|%Y' "$1" 2>/dev/null || printf '0|0|0|0\n'
+  fi
+}
+
+_pair_identity() {
+  if [[ "$OSTYPE" == darwin* || "$OSTYPE" == *bsd* ]]; then
+    stat -f '%i|%Fm|%z' "$1" "$2" 2>/dev/null
+  else
+    stat -c '%i|%y|%s' "$1" "$2" 2>/dev/null
+  fi
+}
+
+# _transcript_raw_metrics reads complete JSONL records from stdin and prints
+# hits, total, latency sum/count, final event and raw-substring ultracode state.
+# The raw matching is intentional: it preserves the documented last-event-wins
+# behaviour for attachment text without changing existing ultracode semantics.
+_transcript_raw_metrics() {
+  jq -Rrs '
+    def role:
+      if (.type == "user" or .type == "human") then "user"
+      elif .type == "assistant" then "assistant"
+      elif ((.message.role // .role // "") == "user" or (.message.role // .role // "") == "human") then "user"
+      elif ((.message.role // .role // "") == "assistant") then "assistant"
+      else null end;
+    def number_ts:
+      if type == "number" then .
+      elif type == "string" then tonumber? else null end
+      | if . == null then null else until(. <= 9999999999; . / 1000) end;
+    def iso_ts:
+      sub("\\.[0-9]+(?=(Z|[+-][0-9]{2}:[0-9]{2})$)"; "")
+      | capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<zone>Z|(?<sign>[+-])(?<oh>[0-9]{2}):(?<om>[0-9]{2}))$")?
+      | if . == null then null else
+          (.base | strptime("%Y-%m-%dT%H:%M:%S") | mktime) as $base
+          | if .zone == "Z" then $base else
+              ((.oh|tonumber) * 3600 + (.om|tonumber) * 60) as $off
+              | $base + (if .sign == "+" then -$off else $off end)
+            end
+        end;
+    def ts:
+      .timestamp as $t |
+      if ($t == null or ($t|type) == "boolean") then null
+      elif ($t|type) == "number" then ($t|number_ts)
+      elif ($t|type) == "string" then
+        (($t | iso_ts) // ($t|number_ts))
+      elif ($t|type) == "object" then
+        ($t.unix // $t.seconds // $t.sec // $t.time // $t.milliseconds // $t.ms // null | number_ts)
+      else null end;
+    . as $raw |
+    ($raw | rindex("\n")) as $nl |
+    (if $nl == null then "" else $raw[0:$nl + 1] end) as $complete |
+    ($complete | split("\n")[:-1]) as $lines |
+    [$lines[] | {raw: ., o: fromjson?} | select(.o != null)] as $rows |
+    (reduce $rows[] as $r ({h:0,t:0};
+      ($r.o.message.usage // $r.o.toolUseResult.usage // null) as $u |
+      if $u == null then . else .h += ($u.cache_read_input_tokens // 0) | .t += (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0) + ($u.cache_read_input_tokens // 0)) end)) as $tokens |
+    [$rows | to_entries[] | . as $e | ($e.value.o | role) as $r | ($e.value.o | ts) as $t | select($r != null and $t != null) | {r:$r,t:$t,i:$e.key}] | sort_by(.t,.i) as $events |
+    (reduce $events[] as $e ({sum:0,n:0,prev:null};
+      if (.prev != null and .prev.r == "user" and $e.r == "assistant") then
+        ($e.t - .prev.t) as $d | if $d > 0 and $d < 86400 then .sum += $d | .n += 1 else . end
+      else . end | .prev = $e)) as $lat |
+    (reduce $rows[] as $r ({seen:0,state:0};
+      if ($r.raw|contains("\"type\":\"ultra_effort_enter\"")) then {seen:1,state:1}
+      elif ($r.raw|contains("\"type\":\"ultra_effort_exit\"")) then {seen:1,state:0}
+      else . end)) as $uc |
+    [ $tokens.h, $tokens.t, $lat.sum, $lat.n,
+      ($events[0].t // "-"), ($events[0].r // "-"),
+      ($lat.prev.t // "-"), ($lat.prev.r // "-"),
+      $uc.seen, $uc.state, ($complete|utf8bytelength),
+      (if $complete == "" then "-" else ($complete[-128:] | @base64) end),
+      ($complete[-128:] | utf8bytelength) ] | @tsv
+  ' 2>/dev/null
+}
+
+_base64_nowrap() {
+  if [[ "$OSTYPE" == darwin* || "$OSTYPE" == *bsd* ]]; then base64 -b 0
+  else base64 -w 0
+  fi
+}
+
+# Shared, incremental transcript cache.  Cache payload is deliberately plain
+# TSV for Bash 3.2 portability; line 1 is a schema/version guard.
+_transcript_metrics() {
+  local path="$1" need_cache="$2" need_latency="$3" inode mtime size key cache lock
+  local v ci cm cs offset cv lv hits total lsum lcount last_ts last_role uc used
+  local sh st ss sn first_ts first_role slast_ts slast_role useen suc consumed sig siglen old_sig old_siglen
+  local rebuild=0 append=0 locked=0
+  IFS='|' read -r inode mtime size _identity_epoch < <(_file_identity "$path")
+  _path_hash "$path"; key=$_PATH_HASH_RESULT
+  cache="$_CLAUDE_DIR/statusline-transcript-metrics.${key}.cache"
+  lock="${cache}.lock"
+  if [ -f "$cache" ]; then
+    {
+      IFS= read -r v; IFS= read -r ci; IFS= read -r cm; IFS= read -r cs; IFS= read -r offset
+      IFS= read -r cv; IFS= read -r lv; IFS= read -r hits; IFS= read -r total
+      IFS= read -r lsum; IFS= read -r lcount; IFS= read -r last_ts; IFS= read -r last_role
+      IFS= read -r uc; IFS= read -r used; IFS= read -r sig; IFS= read -r siglen
+    } < "$cache"
+    if [ "$v" != "4" ] || [ "$ci" != "$inode" ] ||
+       ! [[ "$cs" =~ ^[0-9]+$ && "$offset" =~ ^[0-9]+$ && "$hits" =~ ^[0-9]+([.][0-9]+)?$ && "$total" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+       ! [[ "$used" =~ ^[0-9]+$ ]] ||
+       [ "$size" -lt "$offset" ] 2>/dev/null; then
+      rebuild=1
+    elif [ "$size" -eq "$cs" ] 2>/dev/null; then
+      [ "$mtime" = "$cm" ] || rebuild=1
+    else
+      append=1
+    fi
+  else
+    rebuild=1
+  fi
+
+  [ "$need_cache" = 1 ] && [ "${cv:-0}" != 1 ] && rebuild=1
+  [ "$need_latency" = 1 ] && [ "${lv:-0}" != 1 ] && rebuild=1
+
+  if [ "$rebuild" = 0 ] && [ "$append" = 0 ]; then
+    if [ $(( NOW - used )) -ge 86400 ] 2>/dev/null && mkdir "$lock" 2>/dev/null; then
+      _tm_tmp="$cache.$_TMP_TAG.tmp"
+      printf '4\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$inode" "$mtime" "$size" "$offset" "$cv" "$lv" "$hits" "$total" "$lsum" "$lcount" "$last_ts" "$last_role" "$uc" "$NOW" "$sig" "$siglen" > "$_tm_tmp" && mv "$_tm_tmp" "$cache"
+      rmdir "$lock" 2>/dev/null
+    fi
+    _TM_RESULT="$hits"$'\t'"$total"$'\t'"$lsum"$'\t'"$lcount"$'\t'"$uc"
+    return
+  fi
+
+  if [ "$append" = 1 ] && [ "${siglen:-0}" -gt 0 ] 2>/dev/null; then
+    _source_sig=$(dd if="$path" bs=1 skip=$(( offset - siglen )) count="$siglen" 2>/dev/null | _base64_nowrap)
+    [ "$_source_sig" = "$sig" ] || { rebuild=1; append=0; }
+  fi
+
+  # Serialize updates briefly.  Contention never blocks the prompt: after two
+  # attempts, compute a correct uncached result and leave the winner's cache alone.
+  mkdir "$lock" 2>/dev/null && locked=1
+  if [ "$locked" = 0 ]; then
+    sleep 0.02
+    mkdir "$lock" 2>/dev/null && locked=1
+  fi
+  if [ "$locked" = 0 ]; then
+    IFS=$'\t' read -r hits total lsum lcount first_ts first_role last_ts last_role useen uc consumed sig siglen < <(_transcript_raw_metrics < "$path")
+    _TM_RESULT="${hits:-0}"$'\t'"${total:-0}"$'\t'"${lsum:-0}"$'\t'"${lcount:-0}"$'\t'"${uc:-0}"
+    return
+  fi
+
+  if [ "$append" = 1 ]; then
+    old_sig=$sig; old_siglen=$siglen
+    IFS=$'\t' read -r sh st ss sn first_ts first_role slast_ts slast_role useen suc consumed sig siglen < <(tail -c "+$(( offset + 1 ))" "$path" 2>/dev/null | _transcript_raw_metrics)
+    : "${sh:=0}" "${st:=0}" "${ss:=0}" "${sn:=0}" "${useen:=0}" "${consumed:=0}"
+    [ "$consumed" -gt 0 ] 2>/dev/null || { sig=$old_sig; siglen=$old_siglen; }
+    if [ "$first_ts" != - ] && [ "$last_ts" != - ] && awk -v a="$first_ts" -v b="$last_ts" 'BEGIN{exit(a<b?0:1)}'; then
+      rebuild=1
+    else
+      hits=$(awk -v a="$hits" -v b="$sh" 'BEGIN{print a+b}')
+      total=$(awk -v a="$total" -v b="$st" 'BEGIN{print a+b}')
+      lsum=$(awk -v a="$lsum" -v b="$ss" 'BEGIN{print a+b}')
+      lcount=$(( ${lcount:-0} + ${sn:-0} ))
+      if [ "$last_role" = user ] && [ "$first_role" = assistant ]; then
+        _boundary=$(awk -v a="$first_ts" -v b="$last_ts" 'BEGIN{d=a-b; if(d>0&&d<86400) print d}')
+        if [ -n "$_boundary" ]; then
+          lsum=$(awk -v a="$lsum" -v b="$_boundary" 'BEGIN{print a+b}')
+          lcount=$(( lcount + 1 ))
+        fi
+      fi
+      [ "$slast_ts" != - ] && { last_ts="$slast_ts"; last_role="$slast_role"; }
+      [ "$useen" = 1 ] && uc="$suc"
+      offset=$(( offset + consumed ))
+    fi
+  fi
+  if [ "$rebuild" = 1 ]; then
+    IFS=$'\t' read -r hits total lsum lcount first_ts first_role last_ts last_role useen uc consumed sig siglen < <(_transcript_raw_metrics < "$path")
+    offset=${consumed:-0}
+  fi
+  : "${hits:=0}" "${total:=0}" "${lsum:=0}" "${lcount:=0}" "${uc:=0}"
+  cv=$(( ${cv:-0} || need_cache )); lv=$(( ${lv:-0} || need_latency ))
+  _tm_tmp="$cache.$_TMP_TAG.tmp"
+  printf '4\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$inode" "$mtime" "$size" "$offset" "$cv" "$lv" "$hits" "$total" "$lsum" "$lcount" "$last_ts" "$last_role" "$uc" "$NOW" "$sig" "$siglen" > "$_tm_tmp" && mv "$_tm_tmp" "$cache"
+  rmdir "$lock" 2>/dev/null
+  if [ "$need_cache" = 0 ]; then hits=0; total=0; fi
+  if [ "$need_latency" = 0 ]; then lsum=0; lcount=0; fi
+  _TM_RESULT="$hits"$'\t'"$total"$'\t'"$lsum"$'\t'"$lcount"$'\t'"$uc"
+}
 
 # _env_opt VAR_NAME default val1 val2 … — case-fold + validate env var (bash 3.2 safe)
 _env_opt() {
   local _var="$1" _def="$2"; shift 2
-  local val; val=$(tr '[:upper:]' '[:lower:]' <<< "${!_var:-$_def}")
-  local v; for v in "$@"; do [ "$val" = "$v" ] && { printf '%s' "$val"; return; }; done
-  printf '%s' "$_def"
+  local val="${!_var:-$_def}" v
+  shopt -s nocasematch
+  for v in "$@"; do [[ "$val" == "$v" ]] && { _ENV_OPT_RESULT="$v"; return; }; done
+  _ENV_OPT_RESULT="$_def"
 }
 
 # _fmt_money value [decimals=2] — locale-aware monetary format via integer math.
@@ -161,6 +385,33 @@ _fmt_money() {
   }'
 }
 
+_fmt_money_pair() {
+  awk -v a="$1" -v b="$2" -v dp="$DECIMAL_POINT" 'BEGIN {
+    printf "%s\n%s\n", money(a), money(b)
+  }
+  function money(x, c) {
+    c=int(x*100+0.5)
+    return sprintf("%d%s%02d", int(c/100), dp, c%100)
+  }'
+}
+
+# Fast formatter for non-negative, normalized rolling-window values.
+_fmt_fixed_money() {
+  local value=${1/,/.} decimals=${2:-2} whole frac round n
+  whole=${value%%.*}; frac=${value#*.}
+  [ "$frac" = "$value" ] && frac=""
+  frac="${frac}000000"
+  if [ "$decimals" = 0 ]; then
+    n=$((10#${whole:-0})); [ "${frac:0:1}" -ge 5 ] && n=$((n+1))
+    _MONEY_RESULT=$n
+  else
+    n=$((10#${frac:0:2})); [ "${frac:2:1}" -ge 5 ] && n=$((n+1))
+    if [ "$n" -ge 100 ]; then whole=$((10#${whole:-0}+1)); n=0; fi
+    printf -v round '%02d' "$n"
+    _MONEY_RESULT="${whole:-0}${DECIMAL_POINT}${round}"
+  fi
+}
+
 # _fmt_cents cents [decimals=2] — convert integer cents to USD string, locale-aware decimal point
 _fmt_cents() {
   local c=$1 d=${2:-2}
@@ -173,32 +424,33 @@ _fmt_cents() {
 
 # _cost_same(a, b) — exit 0 when |a-b| <= COST_EQ_THRESHOLD (§8.6 equality test)
 _cost_same() {
-  awk -v a="$1" -v b="$2" -v thr="$COST_EQ_THRESHOLD" \
-    'BEGIN { d = a - b; if (d < 0) d = -d; exit (d <= thr ? 0 : 1) }'
+  local a=${1/./} b=${2/./} d
+  a=$((10#$a)); b=$((10#$b)); d=$(( a - b )); (( d < 0 )) && d=$(( -d ))
+  [ "$d" -le "$COST_EQ_THRESHOLD_U" ]
 }
 
 # _mid_ellipsis(str, target_len) — middle-ellipsis, tail-weighted 40/60 split
 _mid_ellipsis() {
   local str="$1" target="$2"
   local slen="${#str}"
-  if (( slen <= target )); then printf '%s' "$str"; return; fi
-  if (( target < 3 )); then printf '%s' "${str:0:$target}"; return; fi
+  if (( slen <= target )); then _FORMAT_RESULT="$str"; return; fi
+  if (( target < 3 )); then _FORMAT_RESULT="${str:0:$target}"; return; fi
   local budget=$(( target - 1 ))   # 1 char for "…"
   local head=$(( budget * 4 / 10 ))
   (( head < 1 )) && head=1
   local tail=$(( budget - head ))
   local tail_start=$(( slen - tail ))
-  printf '%s' "${str:0:$head}…${str:$tail_start}"
+  _FORMAT_RESULT="${str:0:$head}…${str:$tail_start}"
 }
 
 # _shorten_path(str, max) — slash-aware shortener for CWD and branch names
 _shorten_path() {
   local str="$1" max="$2"
-  if (( ${#str} <= max )); then printf '%s' "$str"; return; fi
+  if (( ${#str} <= max )); then _FORMAT_RESULT="$str"; return; fi
 
   # Min-savings guard: a "…" insertion costs 1 char; if the string is
   # only a few chars over budget the ellipsized form is not worthwhile.
-  if (( ${#str} - max < 5 )); then printf '%s' "$str"; return; fi
+  if (( ${#str} - max < 5 )); then _FORMAT_RESULT="$str"; return; fi
 
   # Tokenize on '/'. Bash 3.2: read each segment individually.
   local IFS='/'
@@ -229,7 +481,7 @@ _shorten_path() {
   local candidate="${prefix}/${last}"
 
   if (( ${#candidate} <= max )); then
-    printf '%s' "$candidate"
+    _FORMAT_RESULT="$candidate"
     return
   fi
 
@@ -242,12 +494,13 @@ _shorten_path() {
   # alternative mid-ellipsis would retain less than half of it, prefer the
   # cleaner form. May exceed max by up to 1 char.
   if (( last_budget >= 3 && ${#last} <= max - 1 && n <= 4 && (last_budget - 1) * 2 < ${#last} )); then
-    printf '%s' "…/${last}"
+    _FORMAT_RESULT="…/${last}"
     return
   fi
 
   if (( last_budget >= 3 )); then
-    printf '%s' "${prefix}/$(_mid_ellipsis "$last" "$last_budget")"
+    _mid_ellipsis "$last" "$last_budget"
+    _FORMAT_RESULT="${prefix}/${_FORMAT_RESULT}"
     return
   fi
 
@@ -259,11 +512,12 @@ _shorten_path() {
     local collapsed_prefix="${parts[0]}/${first_inter}/…/${second_to_last_inter}"
     local collapsed_budget=$(( max - ${#collapsed_prefix} - 1 ))
     if (( collapsed_budget >= 3 )); then
-      printf '%s' "${collapsed_prefix}/$(_mid_ellipsis "$last" "$collapsed_budget")"
+      _mid_ellipsis "$last" "$collapsed_budget"
+      _FORMAT_RESULT="${collapsed_prefix}/${_FORMAT_RESULT}"
       return
     fi
     if (( collapsed_budget > 0 && ${#last} <= collapsed_budget )); then
-      printf '%s' "${collapsed_prefix}/${last}"
+      _FORMAT_RESULT="${collapsed_prefix}/${last}"
       return
     fi
   fi
@@ -321,55 +575,88 @@ _release_lock() {
 # §11: fmt_ctx_k(n) — format token count with optional k suffix
 fmt_ctx_k() {
   local n=$1
-  awk -v n="$n" 'BEGIN { if (n >= 1000) printf "%dk", int((n+500)/1000); else printf "%d", n }'
+  if [ "$n" -ge 1000 ] 2>/dev/null; then _FMT_CTX_RESULT="$(( (n + 500) / 1000 ))k"
+  else _FMT_CTX_RESULT="${n:-0}"
+  fi
 }
 
 # ── Persistent state (§4.1, §4.2) ─────────────────────────────────────────────
 NOW=$(date +%s)
-ws_hash=$(workspace_hash "$cwd")
-
-# Session ID fallback (§13)
 [ -z "$session_id" ] && session_id="anon"
-
-# Initialize baseline_cost to current cost (no-baseline fallback)
 mkdir -p "$_CLAUDE_DIR"
-baseline_cost="$cost"
 
-if _acquire_lock; then
+# Carry lines 1-3 are the original public format.  Lines 4-8 are a lazy,
+# backward-compatible hot-path cache for the baseline and log metadata.
+_cf_sid="" _cf_pcost="" _cf_carry="0" _cf_baseline="" _cf_touch="0"
+_cf_log_time="0" _cf_cwd="" _cf_ws_hash=""
+_first_instance_render=0
+if [ -f "$CARRY_FILE" ]; then
+  {
+    IFS= read -r _cf_sid; IFS= read -r _cf_pcost; IFS= read -r _cf_carry
+    IFS= read -r _cf_baseline; IFS= read -r _cf_touch; IFS= read -r _cf_log_time
+    IFS= read -r _cf_cwd; IFS= read -r _cf_ws_hash
+  } < "$CARRY_FILE"
+else
+  _first_instance_render=1
+fi
+: "${_cf_carry:=0}" "${_cf_touch:=0}" "${_cf_log_time:=0}"
+
+baseline_cost="$cost"
+_baseline_due=1
+if [ "$_cf_sid" = "$session_id" ] && [ -n "$_cf_baseline" ]; then
+  baseline_cost="$_cf_baseline"
+  _baseline_due=0
+  [ $(( NOW - _cf_touch )) -ge 86400 ] 2>/dev/null && _baseline_due=1
+fi
+
+_log_due=0
+[ "$_cf_sid" != "$session_id" ] && _log_due=1
+[ "$_cf_pcost" != "$cost_6f" ] && _log_due=1
+[ "$_cf_cwd" != "$cwd" ] && _log_due=1
+[ $(( NOW - _cf_log_time )) -ge 300 ] 2>/dev/null && _log_due=1
+ws_hash="$_cf_ws_hash"
+
+if { [ "$_baseline_due" = 1 ] || [ "$_log_due" = 1 ]; } && _acquire_lock; then
   trap _release_lock EXIT
 
   # ── Session baseline upsert (§4.2) ─────────────────────────────────────────
-  existing_baseline=""
-  [ -f "$BASELINE_FILE" ] && \
-    existing_baseline=$(awk -F'\t' -v sid="$session_id" '$1==sid{print $2;exit}' "$BASELINE_FILE")
-
-  if [ -n "$existing_baseline" ]; then
-    baseline_cost="$existing_baseline"
+  if [ "$_baseline_due" = 1 ]; then
+    existing_baseline=""
+    [ -f "$BASELINE_FILE" ] && existing_baseline=$(awk -F'\t' -v sid="$session_id" '$1==sid{print $2;exit}' "$BASELINE_FILE")
     cutoff_30d=$(( NOW - BASELINE_TTL ))
     _bt="$BASELINE_FILE.$_TMP_TAG.tmp"
-    if [ $(( RANDOM % 100 )) -eq 0 ]; then
-      awk -F'\t' -v OFS='\t' -v sid="$session_id" -v now="$NOW" -v cutoff="$cutoff_30d" '
+    if [ -n "$existing_baseline" ]; then
+      baseline_cost="$existing_baseline"
+      if awk -F'\t' -v OFS='\t' -v sid="$session_id" -v now="$NOW" -v cutoff="$cutoff_30d" '
         $1==sid { $4=now }
         $4+0 >= cutoff { print }
-      ' "$BASELINE_FILE" > "$_bt" && [ -s "$_bt" ] && mv "$_bt" "$BASELINE_FILE" || rm -f "$_bt"
+      ' "$BASELINE_FILE" > "$_bt" && [ -s "$_bt" ]; then mv "$_bt" "$BASELINE_FILE"; else rm -f "$_bt"; fi
     else
-      awk -F'\t' -v OFS='\t' -v sid="$session_id" -v now="$NOW" '
-        $1==sid { $4=now }
-        { print }
-      ' "$BASELINE_FILE" > "$_bt" && [ -s "$_bt" ] && mv "$_bt" "$BASELINE_FILE" || rm -f "$_bt"
+      baseline_cost="$cost"
+      if [ -f "$BASELINE_FILE" ]; then
+        awk -F'\t' -v cutoff="$cutoff_30d" '$4+0 >= cutoff' "$BASELINE_FILE" > "$_bt" || :
+        printf '%s\t%s\t%d\t%d\n' "$session_id" "$cost_6f" "$NOW" "$NOW" >> "$_bt"
+        mv "$_bt" "$BASELINE_FILE"
+      else
+        printf '%s\t%s\t%d\t%d\n' "$session_id" "$cost_6f" "$NOW" "$NOW" > "$BASELINE_FILE"
+      fi
     fi
-  else
-    baseline_cost="$cost"
-    printf '%s\t%.6f\t%d\t%d\n' "$session_id" "$cost_6f" "$NOW" "$NOW" >> "$BASELINE_FILE"
+    _cf_touch="$NOW"
   fi
 
   # ── Global usage log append + prune (§4.1) ─────────────────────────────────
-  printf '%d %s %s %s\n' "$NOW" "$session_id" "$cost_6f" "$ws_hash" >> "$LOG_FILE"
+  if [ "$_log_due" = 1 ]; then
+    if [ "$cwd" != "$_cf_cwd" ] || [ -z "$ws_hash" ]; then
+      ws_hash=$(workspace_hash "$cwd")
+    fi
+    printf '%d %s %s %s\n' "$NOW" "$session_id" "$cost_6f" "$ws_hash" >> "$LOG_FILE"
+    _cf_log_time="$NOW"
+  fi
 
-  if [ "$(_fsize "$LOG_FILE")" -gt "$LOG_PRUNE_SIZE_MAX" ]; then
+  if [ "$_log_due" = 1 ] && [ "$(_fsize "$LOG_FILE")" -gt "$LOG_PRUNE_SIZE_MAX" ]; then
     _lt="$LOG_FILE.$_TMP_TAG.tmp"
     cutoff_36h=$(( NOW - LOG_PRUNE_WINDOW ))
-    awk -v cutoff="$cutoff_36h" '
+    if awk -v cutoff="$cutoff_36h" '
       NF >= 4 {
         t = $1 + 0; sid = $2
         if (t >= cutoff) {
@@ -382,7 +669,7 @@ if _acquire_lock; then
         for (sid in anc_row) print anc_row[sid]
         for (i = 1; i <= nr; i++) print recent[i]
       }
-    ' "$LOG_FILE" | sort -n > "$_lt" && [ -s "$_lt" ] && mv "$_lt" "$LOG_FILE" || rm -f "$_lt"
+    ' "$LOG_FILE" | sort -n > "$_lt" && [ -s "$_lt" ]; then mv "$_lt" "$LOG_FILE"; else rm -f "$_lt"; fi
   fi
 
   _release_lock
@@ -397,8 +684,7 @@ session_cost=$(awk -v inst="$cost" -v base="$baseline_cost" \
 # session_id. We detect this (session change or cost decrease) and accumulate the
 # pre-/clear cost so ∑ⁱ reflects total spend across all /clears this process.
 instance_carry=0
-if [ -f "$CARRY_FILE" ]; then
-  { IFS= read -r _cf_sid; IFS= read -r _cf_pcost; IFS= read -r _cf_carry; } < "$CARRY_FILE"
+if [ "$_first_instance_render" = 0 ]; then
   if [ "$_cf_sid" = "$session_id" ] && \
      awk -v c="$cost_6f" -v p="${_cf_pcost:-0}" 'BEGIN{exit (c+0 >= p+0 - 0.001 ? 0 : 1)}'; then
     instance_carry="${_cf_carry:-0}"
@@ -410,24 +696,34 @@ else
   # First render for this instance: reap dead instances' carry files and the
   # pre-fix global one (which caused stale carry to leak across instances).
   find "$_CLAUDE_DIR" -maxdepth 1 -name 'statusline-instance-carry.*.cache' -mtime +1 -delete 2>/dev/null
+  find "$_CLAUDE_DIR" -maxdepth 1 -name 'statusline-transcript-metrics.*.cache' -mtime +7 -delete 2>/dev/null
   rm -f "$_CLAUDE_DIR/statusline-instance-carry.cache"
 fi
-printf '%s\n%s\n%s\n' "$session_id" "$cost_6f" "$instance_carry" > "$CARRY_FILE"
+printf -v _carry_new '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' "$session_id" "$cost_6f" "$instance_carry" "$baseline_cost" "$_cf_touch" "$_cf_log_time" "$cwd" "$ws_hash"
+_carry_old=""
+[ -f "$CARRY_FILE" ] && _carry_old=$(<"$CARRY_FILE")
+[ "$_carry_new" = "$_carry_old" ] || printf '%s\n' "$_carry_new" > "$CARRY_FILE"
 instance_cost=$(awk -v carry="$instance_carry" -v sess="$session_cost" \
   'BEGIN{printf "%.6f", carry+0 + sess+0}')
 
-cost_mode=$(_env_opt CLAUDE_STATUSLINE_COST_CURRENT on on session instance off)
-loadavg_mode=$(_env_opt CLAUDE_STATUSLINE_COST_LOADAVG on on spent_only off)
-ultracode_mode=$(_env_opt CLAUDE_STATUSLINE_ULTRACODE on on off)
-sign_mode=$(_env_opt CLAUDE_STATUSLINE_BUDGET_SIGN_MODE neutral neutral used_minus remaining_plus both)
-show_pace_ratio=$(_env_opt CLAUDE_STATUSLINE_SHOW_PACE_RATIO on on off)
-git_status_mode=$(_env_opt CLAUDE_STATUSLINE_GIT_STATUS off off dirty on)
-git_untracked_mode=$(_env_opt CLAUDE_STATUSLINE_GIT_UNTRACKED on on off)
+_env_opt CLAUDE_STATUSLINE_COST_CURRENT on on session instance off; cost_mode=$_ENV_OPT_RESULT
+_env_opt CLAUDE_STATUSLINE_COST_LOADAVG on on spent_only off; loadavg_mode=$_ENV_OPT_RESULT
+_env_opt CLAUDE_STATUSLINE_ULTRACODE on on off; ultracode_mode=$_ENV_OPT_RESULT
+_env_opt CLAUDE_STATUSLINE_BUDGET_SIGN_MODE neutral neutral used_minus remaining_plus both; sign_mode=$_ENV_OPT_RESULT
+_env_opt CLAUDE_STATUSLINE_SHOW_PACE_RATIO on on off; show_pace_ratio=$_ENV_OPT_RESULT
+_env_opt CLAUDE_STATUSLINE_GIT_STATUS off off dirty on; git_status_mode=$_ENV_OPT_RESULT
+_env_opt CLAUDE_STATUSLINE_GIT_UNTRACKED on on off; git_untracked_mode=$_ENV_OPT_RESULT
+_env_opt CLAUDE_STATUSLINE_PERF_BADGE on on off cache_only latency_only; perf_mode=$_ENV_OPT_RESULT
 
 hours_per_day="${CLAUDE_STATUSLINE_BUDGET_HOURS_PER_DAY:-6}"
 awk -v h="$hours_per_day" 'BEGIN { exit (h+0 > 0 ? 0 : 1) }' </dev/null 2>/dev/null || hours_per_day=6
 
-work_days_str=$(printf '%s' "${CLAUDE_STATUSLINE_BUDGET_WORK_DAYS:-12345}" | tr -cd '1-7')
+work_days_str=""
+_work_days_raw=${CLAUDE_STATUSLINE_BUDGET_WORK_DAYS:-12345}
+for (( _wd_i=0; _wd_i<${#_work_days_raw}; _wd_i++ )); do
+  _wd_ch=${_work_days_raw:_wd_i:1}
+  case "$_wd_ch" in [1-7]) work_days_str+="$_wd_ch" ;; esac
+done
 [ -z "$work_days_str" ] && work_days_str="12345"
 
 holidays_raw="${CLAUDE_STATUSLINE_BUDGET_HOLIDAYS:-}"
@@ -435,8 +731,7 @@ extra_preview_pct="${CLAUDE_STATUSLINE_EXTRA_PREVIEW_PCT:-75}"
 
 cost_seg=""
 if [ "$cost_mode" != "off" ]; then
-  inst_fmt=$(_fmt_money "$instance_cost")
-  sess_fmt=$(_fmt_money "$session_cost")
+  { IFS= read -r inst_fmt; IFS= read -r sess_fmt; } < <(_fmt_money_pair "$instance_cost" "$session_cost")
   if [ "$cost_mode" = "instance" ]; then
     cost_seg="${RESET}${BLUE}${BOLD}∑ⁱ\$${inst_fmt}${RESET}"
   else
@@ -537,20 +832,21 @@ _roll_slot() {
   local smode="${4:-neutral}" allowance="${5:-}" bcolor="${6:-}"
   local allow_sfx=""
   if [ -n "$allowance" ]; then
-    allow_sfx="/${DIM}\$$(_fmt_money "$allowance" 0)${RESET}"
+    _fmt_fixed_money "$allowance" 0
+    allow_sfx="/${DIM}\$${_MONEY_RESULT}${RESET}"
   fi
   if [ "$nodata" = "1" ]; then
-    printf '%s' "${label}:${DIM}—${RESET}${allow_sfx}"
+    _ROLL_SLOT_RESULT="${label}:${DIM}—${RESET}${allow_sfx}"
     return
   fi
   local remaining=""
   [ -n "$allowance" ] && remaining=$(_fmt_money \
     "$(awk -v a="$allowance" -v s="$spent" 'BEGIN{ r=a-s; print (r>0?r:0) }')")
-  local out="${label}:"
-  local spent_fmt; spent_fmt=$(_fmt_money "$spent")
+  local out="${label}:" spent_fmt
+  _fmt_fixed_money "$spent"; spent_fmt=$_MONEY_RESULT
   case "$smode" in
     used_minus)
-      if awk -v s="$spent" 'BEGIN{exit (s+0>0?0:1)}'; then
+      if [ "$spent" != 0 ] && [ "$spent" != 0.000000 ]; then
         out+="${bcolor}-\$${spent_fmt}${RESET}"
       else
         out+="\$${spent_fmt}"
@@ -575,7 +871,7 @@ _roll_slot() {
         out+="${DIM}\$${spent_fmt}${RESET}${allow_sfx}"
       fi ;;
   esac
-  printf '%s' "$out"
+  _ROLL_SLOT_RESULT="$out"
 }
 
 # ── Line 1 display budget (§7.2, §7.3) ───────────────────────────────────────
@@ -606,17 +902,17 @@ case "$_BRANCH_MAXLEN_raw" in (*[!0-9]*|'') _BRANCH_MAXLEN=$_DEFAULT_BRANCH_MAXL
 #      flag is required — `stty size < /dev/$tty` returns ENOTTY under Claude Code ≥ 2.1.139.
 #   5. _TERM_W_FALLBACK — wide value so undetected width does not cause false compression.
 _term_width_from_ancestor_pty() {
-  local pid=$$
-  local tty w _depth
+  local pid=$$ ppid
+  local tty w _rows _depth
   for _depth in 1 2 3 4 5 6 7 8; do
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    read -r ppid tty < <(ps -o ppid=,tty= -p "$pid" 2>/dev/null)
+    pid=$ppid
     [ -z "$pid" ] || [ "$pid" = "0" ] || [ "$pid" = "1" ] && return 1
-    tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
     [ -z "$tty" ] || [ "$tty" = "??" ] || [ "$tty" = "?" ] && continue
     # Try macOS BSD stty (-f), then Linux GNU stty (-F), then redirect fallback
-    w=$(stty -f "/dev/$tty" size 2>/dev/null | awk '{print $2}') \
-      || w=$(stty -F "/dev/$tty" size 2>/dev/null | awk '{print $2}') \
-      || w=$(stty size < "/dev/$tty" 2>/dev/null | awk '{print $2}')
+    read -r _rows w < <(stty -f "/dev/$tty" size 2>/dev/null) \
+      || read -r _rows w < <(stty -F "/dev/$tty" size 2>/dev/null) \
+      || read -r _rows w < <(stty size < "/dev/$tty" 2>/dev/null)
     if [ -n "$w" ] && [ "$w" -gt 0 ] 2>/dev/null; then
       printf '%s' "$w"; return 0
     fi
@@ -654,14 +950,13 @@ _TERM_W_RAW=$_TERM_W   # save pre-floor value for line 2 adaptive truncation
 # user prompt is built, so a fresh toggle shows up one prompt late. Switch to a jq pass on
 # .attachment.type if either bites.
 _ultracode=0
-if [ "$ultracode_mode" != "off" ] && [ "$effort_level" = "xhigh" ] && \
-   [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -r "$transcript_path" ]; then
-  _ultracode=$(awk '
-    /"type":"ultra_effort_enter"/ { s = 1 }
-    /"type":"ultra_effort_exit"/  { s = 0 }
-    END { print s + 0 }
-  ' "$transcript_path" 2>/dev/null)
-  [ "$_ultracode" = "1" ] || _ultracode=0
+_tm_cache=0 _tm_latency=0 _tm_need_uc=0
+case "$perf_mode" in on) _tm_cache=1; _tm_latency=1 ;; cache_only) _tm_cache=1 ;; latency_only) _tm_latency=1 ;; esac
+[ "$ultracode_mode" != "off" ] && [ "$effort_level" = "xhigh" ] && _tm_need_uc=1
+if { [ "$_tm_cache" = 1 ] || [ "$_tm_latency" = 1 ] || [ "$_tm_need_uc" = 1 ]; } && [ -r "$transcript_path" ]; then
+  _transcript_metrics "$transcript_path" "$_tm_cache" "$_tm_latency"
+  IFS=$'\t' read -r _tm_hits _tm_total _tm_sum _tm_count _tm_uc <<< "$_TM_RESULT"
+  [ "$_tm_need_uc" = 1 ] && [ "$_tm_uc" = 1 ] && _ultracode=1
 fi
 
 # Estimate chars consumed by fixed elements (model, effort, fast, thinking, ctx, leading space).
@@ -685,10 +980,10 @@ _branch_budget=$(( _combined_budget * 55 / 100 ))
 
 # Resolve branch early so CWD gets the actual remaining space, not a worst-case proxy.
 _branch_disp=""
-if [ -n "$cwd" ] && git -C "$cwd" --no-optional-locks rev-parse --git-dir >/dev/null 2>&1; then
-  _branch_raw=$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null)
-  [ -z "$_branch_raw" ] && _branch_raw=$(git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
-  [ -n "$_branch_raw" ] && _branch_disp=$(_shorten_path "$_branch_raw" "$_branch_budget")
+if [ -n "$cwd" ]; then
+  _branch_raw=$(git -C "$cwd" --no-optional-locks rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ "$_branch_raw" = HEAD ] && _branch_raw=$(git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
+  if [ -n "$_branch_raw" ]; then _shorten_path "$_branch_raw" "$_branch_budget"; _branch_disp=$_FORMAT_RESULT; fi
 fi
 
 # §7.3.1 Git status markers (opt-in via CLAUDE_STATUSLINE_GIT_STATUS, off by default —
@@ -765,7 +1060,7 @@ line1=" ${RESET}"
 # §7.2 CWD segment (yellow)
 if [ -n "$cwd" ]; then
   cwd_disp="${cwd/#$HOME/\~}"
-  cwd_disp=$(_shorten_path "$cwd_disp" "$_cwd_budget")
+  _shorten_path "$cwd_disp" "$_cwd_budget"; cwd_disp=$_FORMAT_RESULT
   line1+="${YELLOW}${cwd_disp}${RESET}"
 fi
 
@@ -816,9 +1111,9 @@ else
   fi
 
   # Token counts
-  used_tokens=$(awk -v w="$W" -v u="$used_int" 'BEGIN { printf "%d", int((w*u/100)+0.5) }')
-  used_k=$(fmt_ctx_k "$used_tokens")
-  win_k=$(fmt_ctx_k "$W")
+  used_tokens=$(( (W * used_int + 50) / 100 ))
+  fmt_ctx_k "$used_tokens"; used_k=$_FMT_CTX_RESULT
+  fmt_ctx_k "$W"; win_k=$_FMT_CTX_RESULT
 
   # Effective ceiling E
   E=95
@@ -847,7 +1142,7 @@ else
   if [ -n "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" ] && \
      [ "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" -ge 1 ] 2>/dev/null && \
      [ "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" -le 100 ] 2>/dev/null; then
-    warn_at=$(awk -v e="$E" -v w="$warn_pct" 'BEGIN { printf "%d", int(e*w/100) }')
+    warn_at=$(( E * warn_pct / 100 ))
   else
     warn_at=$warn_pct
   fi
@@ -866,28 +1161,10 @@ else
 fi
 
 # ── Performance badge computation (§8.1, §3.1) ────────────────────────────────
-perf_mode=$(_env_opt CLAUDE_STATUSLINE_PERF_BADGE on on off cache_only latency_only)
-
-_perf_level_for_cache() {
-  awk -v r="$1" 'BEGIN {
-    if (r == "") { print -1; exit }
-    r += 0
-    if      (r >= 95) print 0
-    else if (r >= 90) print 1
-    else if (r >= 75) print 2
-    else              print 3
-  }'
-}
-
-_perf_level_for_latency() {
-  awk -v d="$1" 'BEGIN {
-    if (d == "") { print -1; exit }
-    d += 0
-    if      (d <= 10) print 0
-    else if (d <= 30) print 1
-    else if (d <= 60) print 2
-    else              print 3
-  }'
+_decimal_millis() {
+  local value=$1 whole=${1%%.*} frac
+  frac=${value#*.}; [ "$frac" = "$value" ] && frac=""
+  frac="${frac}000"; _MILLIS_RESULT=$(( 10#${whole:-0} * 1000 + 10#${frac:0:3} ))
 }
 
 _build_perf_badge() {
@@ -901,46 +1178,29 @@ _build_perf_badge() {
       out+="${DOT_GREY}●${RESET}"
     fi
   done
-  printf '%s' "$out"
+  _FORMAT_RESULT="$out"
 }
 
 perf_badge=""
 if [ "$perf_mode" != "off" ]; then
-  hit_rate="" avg_resp=""
-  if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -r "$transcript_path" ]; then
-    signals=$(jq -rs '
-      def usage: (.message.usage // .toolUseResult.usage // null);
-      def ts:
-        .timestamp as $t |
-        if   ($t | type) == "number" then (if $t > 1e12 then $t/1000 else $t end)
-        elif ($t | type) == "string" then ($t | fromdateiso8601? // null)
-        elif ($t | type) == "object" then ($t.epoch // $t.seconds // null)
-        else null end;
-      . as $rows
-      | ([$rows[] | usage | select(. != null)]) as $u
-      | ([$u[] | (.cache_read_input_tokens // 0)] | add // 0) as $hits
-      | ([$u[] | (.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)] | add // 0) as $total
-      | (if $total > 0 then ($hits * 100.0 / $total) else null end) as $hit_rate
-      | (reduce range(0; $rows|length) as $i ([];
-           ($rows[$i]) as $row |
-           if $row.type == "assistant" then
-             ([range(0; $i) | . as $j | $rows[$j] | select(.type == "user") | ts | select(. != null)]) as $uts
-             | ($row | ts) as $a_ts
-             | (if ($uts|length) > 0 then ($uts | last) else null end) as $u_ts
-             | if $u_ts != null and $a_ts != null and ($a_ts - $u_ts) > 0 and ($a_ts - $u_ts) < 86400
-               then . + [$a_ts - $u_ts]
-               else . end
-           else . end
-        )) as $deltas
-      | (if ($deltas|length) > 0 then ($deltas | add / length) else null end) as $avg_resp
-      | "\($hit_rate // "")\t\($avg_resp // "")"
-    ' "$transcript_path" 2>/dev/null)
-    hit_rate="${signals%%	*}"
-    avg_resp="${signals#*	}"
+  cache_level=-1 latency_level=-1
+  if [ -n "$transcript_path" ] && [ -r "$transcript_path" ] && [ -n "${_tm_total:-}" ]; then
+    if [ "$_tm_total" -gt 0 ] 2>/dev/null; then
+      if (( _tm_hits * 100 >= _tm_total * 95 )); then cache_level=0
+      elif (( _tm_hits * 100 >= _tm_total * 90 )); then cache_level=1
+      elif (( _tm_hits * 100 >= _tm_total * 75 )); then cache_level=2
+      else cache_level=3
+      fi
+    fi
+    if [ "$_tm_count" -gt 0 ] 2>/dev/null; then
+      _decimal_millis "$_tm_sum"
+      if (( _MILLIS_RESULT <= _tm_count * 10000 )); then latency_level=0
+      elif (( _MILLIS_RESULT <= _tm_count * 30000 )); then latency_level=1
+      elif (( _MILLIS_RESULT <= _tm_count * 60000 )); then latency_level=2
+      else latency_level=3
+      fi
+    fi
   fi
-
-  cache_level=$(_perf_level_for_cache "$hit_rate")
-  latency_level=$(_perf_level_for_latency "$avg_resp")
 
   case "$perf_mode" in
     cache_only)   overall_level="$cache_level" ;;
@@ -957,22 +1217,27 @@ if [ "$perf_mode" != "off" ]; then
       fi ;;
   esac
 
-  perf_badge=$(_build_perf_badge "$overall_level")
+  _build_perf_badge "$overall_level"; perf_badge=$_FORMAT_RESULT
 fi
 
 # ── Utility: visible-length measurement ──────────────────────────────────────
 
 # _visible_len str — ANSI-stripped display column count; emoji (4-byte UTF-8) count as 2
 _visible_len() {
-  printf '%s' "$1" | LC_ALL=C awk -v ESC='\033' '
-    BEGIN { pat = ESC "\\[[0-9;]*[A-Za-z]" }
-    {
-      s = $0
+  LC_ALL=C awk -v ESC='\033' -v s="$1" -v s2="${2-}" -v two="${2+x}" '
+    BEGIN {
+      pat = ESC "\\[[0-9;]*[A-Za-z]"
+      print _visible(s)
+      if (two != "") print _visible(s2)
+    }
+    function _visible(s, n) {
+      n = 0
       while (match(s, pat)) {
         n += _cols(substr(s, 1, RSTART - 1))
         s  = substr(s, RSTART + RLENGTH)
       }
       n += _cols(s)
+      return n
     }
     function _cols(t,    i, b, c) {
       c = 0; i = 1
@@ -986,7 +1251,6 @@ _visible_len() {
       }
       return c
     }
-    END { print n+0 }
   '
 }
 
@@ -1158,7 +1422,7 @@ fi
 # Phase 2 — read cache state
 cache_age=999999
 if [ -f "$USAGE_CACHE_FILE" ]; then
-  cache_mtime=$(_mtime "$USAGE_CACHE_FILE")
+  IFS='|' read -r cache_inode cache_identity_mtime cache_size cache_mtime < <(_file_identity "$USAGE_CACHE_FILE")
   cache_age=$(( NOW - ${cache_mtime:-0} ))
 fi
 
@@ -1203,19 +1467,26 @@ if [ "$_need_refresh" = "1" ]; then
   ( _fetch_usage_cache_bg & ) >/dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-
 fi
 
-# Parse cache fields — single jq pass
+# Parse cache fields once per source identity. The JSON is replaced atomically
+# by the fetcher, so inode + high-resolution mtime + size is a stable hot key.
 _fh_util="" _sd_util="" _fh_resets="" _sd_resets=""
 _ex_enabled="" _ex_used="" _ex_limit=""
 if [ -f "$USAGE_CACHE_FILE" ]; then
-  {
-    IFS= read -r _fh_util
-    IFS= read -r _sd_util
-    IFS= read -r _fh_resets
-    IFS= read -r _sd_resets
-    IFS= read -r _ex_enabled
-    IFS= read -r _ex_used
-    IFS= read -r _ex_limit
-  } < <(jq -r '
+  _usage_fields_hit=0
+  if [ -f "$USAGE_FIELDS_FILE" ]; then
+    {
+      IFS= read -r _uf_version; IFS= read -r _uf_inode; IFS= read -r _uf_mtime; IFS= read -r _uf_size
+      IFS= read -r _fh_util; IFS= read -r _sd_util; IFS= read -r _fh_resets; IFS= read -r _sd_resets
+      IFS= read -r _ex_enabled; IFS= read -r _ex_used; IFS= read -r _ex_limit
+      IFS= read -r _uf_complete
+    } < "$USAGE_FIELDS_FILE"
+    [ "$_uf_version" = 2 ] && [ "$_uf_complete" = complete ] && [ "$_uf_inode" = "$cache_inode" ] && [ "$_uf_mtime" = "$cache_identity_mtime" ] && [ "$_uf_size" = "$cache_size" ] && _usage_fields_hit=1
+  fi
+  if [ "$_usage_fields_hit" = 0 ]; then
+    {
+      IFS= read -r _fh_util; IFS= read -r _sd_util; IFS= read -r _fh_resets; IFS= read -r _sd_resets
+      IFS= read -r _ex_enabled; IFS= read -r _ex_used; IFS= read -r _ex_limit
+    } < <(jq -r '
       ((.five_hour.utilization // null) | if . then (. + 0.5 | floor | tostring) else "" end),
       ((.seven_day.utilization // null) | if . then (. + 0.5 | floor | tostring) else "" end),
       (.five_hour.resets_at // ""),
@@ -1224,6 +1495,9 @@ if [ -f "$USAGE_CACHE_FILE" ]; then
       (.extra_usage.used_credits // ""),
       (.extra_usage.monthly_limit // "")
     ' "$USAGE_CACHE_FILE" 2>/dev/null)
+    _uf_tmp="$USAGE_FIELDS_FILE.$_TMP_TAG.tmp"
+    printf '2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\ncomplete\n' "$cache_inode" "$cache_identity_mtime" "$cache_size" "$_fh_util" "$_sd_util" "$_fh_resets" "$_sd_resets" "$_ex_enabled" "$_ex_used" "$_ex_limit" > "$_uf_tmp" && mv "$_uf_tmp" "$USAGE_FIELDS_FILE"
+  fi
 fi
 
 # Auth error flag — computed once, used in multiple sections below
@@ -1287,9 +1561,29 @@ if [ -n "$_fh_util" ]; then
 fi
 
 # ── Enterprise monthly display (§8.4) ─────────────────────────────────────────
-_allow_1h="" _allow_1d=""
+_allow_15m="" _allow_1h="" _allow_1d=""
+_oauth_render_hit=0 _oauth_render_enterprise=0 _oauth_render_key=""
 
+# Enterprise rendering includes calendar, pace, runway, and monetary work. Cache
+# its final bytes until the OAuth source, local day, or display inputs change.
 if [ -z "$_fh_util" ] && [ "$_ex_enabled" = "true" ] && [ -n "$_ex_limit" ]; then
+  _oauth_render_enterprise=1
+  _oauth_render_key="1|${cache_inode:-}|${cache_identity_mtime:-}|${cache_size:-}|$_auth_error|$_usage_cache_stale|$loadavg_mode|$sign_mode|$show_pace_ratio|$hours_per_day|$work_days_str|$holidays_raw|$DECIMAL_POINT|$_DAY_START"
+  if [ -f "$USAGE_RENDER_FILE" ]; then
+    {
+      IFS= read -r _ur_version; IFS= read -r _ur_key; IFS= read -r _ur_monthly
+      IFS= read -r _ur_15m; IFS= read -r _ur_1h; IFS= read -r _ur_1d
+      IFS= read -r _ur_complete
+    } < "$USAGE_RENDER_FILE"
+    if [ "$_ur_version" = 2 ] && [ "$_ur_complete" = complete ] && [ -n "$_ur_monthly" ] && [ "$_ur_key" = "$_oauth_render_key" ]; then
+      monthly_seg=$_ur_monthly
+      _allow_15m=$_ur_15m _allow_1h=$_ur_1h _allow_1d=$_ur_1d
+      _oauth_render_hit=1
+    fi
+  fi
+fi
+
+if [ "$_oauth_render_enterprise" = 1 ] && [ "$_oauth_render_hit" = 0 ]; then
   _ex_used_v="${_ex_used:-0}"
   _ex_limit_v="${_ex_limit:-1}"
 
@@ -1439,6 +1733,13 @@ if [ -z "$_fh_util" ] && [ "$_ex_enabled" = "true" ] && [ -n "$_ex_limit" ]; the
 fi
 
 # ── Line 2 assembly (§10) ──────────────────────────────────────────────────────
+if [ "$_oauth_render_enterprise" = 1 ] && [ "$_oauth_render_hit" = 0 ]; then
+  _ur_tmp="$USAGE_RENDER_FILE.$_TMP_TAG.tmp"
+  printf '2\n%s\n%s\n%s\n%s\n%s\ncomplete\n' \
+    "$_oauth_render_key" "$monthly_seg" "$_allow_15m" "$_allow_1h" "$_allow_1d" \
+    > "$_ur_tmp" && mv "$_ur_tmp" "$USAGE_RENDER_FILE"
+fi
+
 # §10 item 1: leading ZWSP + two spaces
 line2="${SPACE}  "
 
@@ -1474,7 +1775,25 @@ fi
 # §10 item 9: rolling 💸 windows — built into _spend_seg for adaptive truncation
 _spend_seg=""
 if [ "$loadavg_mode" != "off" ] && [ -f "$LOG_FILE" ]; then
-  read -r s15 s1h s1d nd15 nd1h nd1d < <(calc_spent_all)
+  _spend_bfile="$BASELINE_FILE"; [ -f "$_spend_bfile" ] || _spend_bfile=/dev/null
+  { IFS= read -r _spend_log_id; IFS= read -r _spend_base_id; } < <(_pair_identity "$LOG_FILE" "$_spend_bfile")
+  # Include a 60s time bucket so the cache self-invalidates on the clock even
+  # when the log/baseline files don't change (write-coalescing can otherwise
+  # leave them untouched for up to the 300s heartbeat, letting rolling-window
+  # totals lag wall-clock time by that much).
+  _spend_key="${_spend_log_id}|${_spend_base_id}|${session_id}|${cost_6f}|${_DAY_START}|$((NOW / 60))"
+  _spend_hit=0
+  if [ -f "$SPEND_METRICS_FILE" ]; then
+    { IFS= read -r _spend_version; IFS= read -r _spend_cached_key; read -r s15 s1h s1d nd15 nd1h nd1d; IFS= read -r _spend_complete; } < "$SPEND_METRICS_FILE"
+    if [ "$_spend_version" = 2 ] && [ "$_spend_complete" = complete ] && [ "$_spend_cached_key" = "$_spend_key" ]; then
+      case "$nd15$nd1h$nd1d" in [01][01][01]) _spend_hit=1 ;; esac
+    fi
+  fi
+  if [ "$_spend_hit" = 0 ]; then
+    read -r s15 s1h s1d nd15 nd1h nd1d < <(calc_spent_all)
+    _spend_tmp="$SPEND_METRICS_FILE.$_TMP_TAG.tmp"
+    printf '2\n%s\n%s %s %s %s %s %s\ncomplete\n' "$_spend_key" "$s15" "$s1h" "$s1d" "$nd15" "$nd1h" "$nd1d" > "$_spend_tmp" && mv "$_spend_tmp" "$SPEND_METRICS_FILE"
+  fi
   # Allowances for 15m/1h/1d (Enterprise + loadavg=on only)
   _r_allow_15m="" _r_allow_1h="" _r_allow_1d=""
   if [ "$loadavg_mode" = "on" ] && [ -n "$_allow_1h" ] && [ "$_auth_error" != "1" ]; then
@@ -1505,7 +1824,10 @@ if [ "$loadavg_mode" != "off" ] && [ -f "$LOG_FILE" ]; then
     _bc_15m="" _bc_1h="" _bc_1d=""
   fi
   # 15m: colored but no allowance suffix (pass empty 5th arg, bcolor as 6th)
-  _spend_seg="${DIM}💸${RESET}  $(_roll_slot 15m "$s15" "$nd15" "$sign_mode" "" "$_bc_15m")  $(_roll_slot 1h "$s1h" "$nd1h" "$sign_mode" "$_r_allow_1h" "$_bc_1h")  $(_roll_slot 1d "$s1d" "$nd1d" "$sign_mode" "$_r_allow_1d" "$_bc_1d")"
+  _roll_slot 15m "$s15" "$nd15" "$sign_mode" "" "$_bc_15m"; _slot_15m=$_ROLL_SLOT_RESULT
+  _roll_slot 1h "$s1h" "$nd1h" "$sign_mode" "$_r_allow_1h" "$_bc_1h"; _slot_1h=$_ROLL_SLOT_RESULT
+  _roll_slot 1d "$s1d" "$nd1d" "$sign_mode" "$_r_allow_1d" "$_bc_1d"; _slot_1d=$_ROLL_SLOT_RESULT
+  _spend_seg="${DIM}💸${RESET}  ${_slot_15m}  ${_slot_1h}  ${_slot_1d}"
 elif [ "$loadavg_mode" != "off" ]; then
   # log file doesn't exist yet (very first run before lock acquired or log created)
   _spend_seg="${DIM}💸${RESET}  15m:${DIM}—${RESET}  1h:${DIM}—${RESET}  1d:${DIM}—${RESET}"
@@ -1515,8 +1837,8 @@ fi
 # Uses _TERM_W_RAW (pre-floor) so narrow terminals (<88) still trigger suppression.
 if [ -n "$_spend_seg" ]; then
   _line2_available=$(( _TERM_W_RAW - 3 ))
-  _len_without=$(( $(_visible_len "$line2") - 3 ))
-  _len_spend=$(_visible_len "$_spend_seg")
+  { IFS= read -r _len_without; IFS= read -r _len_spend; } < <(_visible_len "$line2" "$_spend_seg")
+  _len_without=$(( _len_without - 3 ))
 
   if [ "$_len_without" -le "$_line2_available" ] && \
      [ $(( _len_without + _len_spend )) -gt "$_line2_available" ]; then
